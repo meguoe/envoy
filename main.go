@@ -114,7 +114,6 @@ func main() {
 	case <-done:
 		log.Printf("✅ gRPC 已关闭")
 	case <-time.After(3 * time.Second):
-		log.Printf("⚠️  gRPC 优雅关闭超时，强制关闭")
 		grpcSrv.Stop()
 	}
 

@@ -313,11 +313,16 @@ func (e *Engine) IsEnvoyConnected() bool {
 }
 
 // GetEnvoyNodes 返回所有已连接的 Envoy 节点信息
+// 仅返回持有活跃 gRPC watch 的节点（watches > 0 || delta_watches > 0）
 func (e *Engine) GetEnvoyNodes() []map[string]any {
 	var nodes []map[string]any
 	for _, key := range e.snapCache.GetStatusKeys() {
 		info := e.snapCache.GetStatusInfo(key)
 		if info == nil {
+			continue
+		}
+		// 没有活跃 watch 说明 Envoy 已断开，跳过
+		if info.GetNumWatches() == 0 && info.GetNumDeltaWatches() == 0 {
 			continue
 		}
 		node := info.GetNode()
@@ -333,7 +338,6 @@ func (e *Engine) GetEnvoyNodes() []map[string]any {
 			entry["cluster"] = node.GetCluster()
 			entry["user_agent"] = node.GetUserAgentName()
 			entry["version"] = node.GetUserAgentVersion()
-			entry["listening_addresses"] = node.GetListeningAddresses()
 		}
 		nodes = append(nodes, entry)
 	}
