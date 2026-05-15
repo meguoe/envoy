@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	server "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	grpc "google.golang.org/grpc"
@@ -35,10 +36,10 @@ import (
 // ruleRes 缓存单条规则构建好的 protobuf 资源
 type ruleRes struct {
 	owner    *ProxyRule
-	endpoint interface{ ProtoMessage() } // EDS（UDP 时为 nil）
-	cluster  interface{ ProtoMessage() } // CDS
-	route    interface{ ProtoMessage() } // RDS（UDP 时为 nil）
-	listener interface{ ProtoMessage() } // LDS
+	endpoint types.Resource // EDS
+	cluster  types.Resource // CDS
+	route    types.Resource // RDS
+	listener types.Resource // LDS
 }
 
 // ValidationError 业务校验错误，区别于系统错误（如推送失败）
@@ -56,7 +57,7 @@ type Engine struct {
 	nodeID         string
 	snapCache      cache.SnapshotCache
 	rules          map[string]*ProxyRule
-	resCache       map[string]*ruleRes
+	resCache       map[string]*ruleRes // 注意: 仅在 pushMu 保护下读写, 不可并发访问
 	versionSeq     uint64
 	mu             sync.RWMutex // 保护 rules
 	pushMu         sync.Mutex   // 串行化「修改 + 推送」
@@ -168,6 +169,7 @@ func (e *Engine) CreateRule(rule *ProxyRule) (*ProxyRule, error) {
 	if err := ValidateRule(rule); err != nil {
 		return nil, err
 	}
+	NormalizeRule(rule)
 	rule.ID = GenerateID()
 
 	e.pushMu.Lock()

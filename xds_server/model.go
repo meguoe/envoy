@@ -66,6 +66,10 @@ type ProxyRule struct {
 
 // ValidateRule 校验规则，不修改输入参数
 // 返回 ValidationError 表示校验失败
+//
+// 注意: ListenPort == 0 会被拦截。对于 UpdateRule 场景，
+// 调用方应在 ValidateRule 之前将未传字段合并旧值（如 handleUpdate），
+// 避免 0 值被误判为"未传"而非"非法"。
 func ValidateRule(rule *ProxyRule) error {
 	if rule.Name == "" {
 		return &ValidationError{Msg: "name 不能为空"}

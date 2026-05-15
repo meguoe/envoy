@@ -3,6 +3,9 @@ package xdsServer
 // cache.go —— 增量缓存同步
 //
 // 通过指针比较检测变更，只重建新增/变更的规则资源
+//
+// 注意: resCache 的读写由 pushMu 保护，仅在 pushSnapshotLocked 内调用，
+// 不可并发访问。
 
 import (
 	"log"
@@ -46,13 +49,13 @@ func (e *Engine) collectResources(names []string) (eps, cls, rts, lis []types.Re
 	for _, name := range names {
 		cr := e.resCache[name]
 		if cr.endpoint != nil {
-			eps = append(eps, cr.endpoint.(types.Resource))
+			eps = append(eps, cr.endpoint)
 		}
-		cls = append(cls, cr.cluster.(types.Resource))
+		cls = append(cls, cr.cluster)
 		if cr.route != nil {
-			rts = append(rts, cr.route.(types.Resource))
+			rts = append(rts, cr.route)
 		}
-		lis = append(lis, cr.listener.(types.Resource))
+		lis = append(lis, cr.listener)
 	}
 	return
 }

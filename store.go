@@ -53,7 +53,7 @@ func loadRules() ([]*xdsServer.ProxyRule, error) {
 
 func saveRules(list []*xdsServer.ProxyRule) error {
 	sort.Slice(list, func(i, j int) bool {
-		return list[i].Name < list[j].Name
+		return list[i].ID < list[j].ID
 	})
 
 	data, err := json.Marshal(list)
