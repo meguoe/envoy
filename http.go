@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -149,9 +148,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		respErr(w, status, err.Error())
 		return
 	}
-	if err := saveRules(engine.ListRules()); err != nil {
-		log.Printf("⚠️  持久化失败（Envoy 配置已生效）: %v", err)
-	}
 	respCreated(w, created)
 }
 
@@ -215,9 +211,6 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
 		respErr(w, status, err.Error())
 		return
 	}
-	if err := saveRules(engine.ListRules()); err != nil {
-		log.Printf("⚠️  持久化失败（Envoy 配置已生效）: %v", err)
-	}
 	respOK(w, updated)
 }
 
@@ -233,9 +226,6 @@ func handleDelete(w http.ResponseWriter, id string) {
 		}
 		respErr(w, status, err.Error())
 		return
-	}
-	if err := saveRules(engine.ListRules()); err != nil {
-		log.Printf("⚠️  持久化失败（Envoy 配置已生效）: %v", err)
 	}
 	respOK(w, map[string]string{"id": id})
 }

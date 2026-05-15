@@ -53,30 +53,37 @@ var ErrRuleNotFound = errors.New("rule not found")
 
 // Engine xDS 引擎，封装所有 xDS 状态
 type Engine struct {
-	nodeID          string
-	snapCache       cache.SnapshotCache
-	rules           map[string]*ProxyRule
-	resCache        map[string]*ruleRes
-	lastContentHash string
-	versionSeq      uint64
-	mu              sync.RWMutex // 保护 rules
-	pushMu          sync.Mutex   // 串行化「修改 + 推送」
-	onRulesChanged  func()
+	nodeID         string
+	snapCache      cache.SnapshotCache
+	rules          map[string]*ProxyRule
+	resCache       map[string]*ruleRes
+	versionSeq     uint64
+	mu             sync.RWMutex // 保护 rules
+	pushMu         sync.Mutex   // 串行化「修改 + 推送」
+	onRulesChanged func()
 }
 
 // NewEngine 创建 xDS 引擎
 func NewEngine(nodeID string) *Engine {
 	return &Engine{
 		nodeID:    nodeID,
-		snapCache: cache.NewSnapshotCache(false, cache.IDHash{}, nil),
+		snapCache: cache.NewSnapshotCache(true, cache.IDHash{}, nil),
 		rules:     make(map[string]*ProxyRule),
 		resCache:  make(map[string]*ruleRes),
 	}
 }
 
 // SetOnRulesChanged 设置规则变更后的持久化回调
+// 每次 CRUD 成功并推送快照后自动调用
 func (e *Engine) SetOnRulesChanged(fn func()) {
 	e.onRulesChanged = fn
+}
+
+// notifyRulesChanged 非阻塞通知持久化
+func (e *Engine) notifyRulesChanged() {
+	if e.onRulesChanged != nil {
+		go e.onRulesChanged()
+	}
 }
 
 // ─── gRPC 服务器 ───────────────────────────────────────────────────────
@@ -185,6 +192,7 @@ func (e *Engine) CreateRule(rule *ProxyRule) (*ProxyRule, error) {
 		return nil, fmt.Errorf("push snapshot: %w", err)
 	}
 
+	e.notifyRulesChanged()
 	log.Printf("➕ Rule created: %s (%s)  %s:%d → %d backends [%s]",
 		rule.ID, rule.Name, rule.ListenAddr, rule.ListenPort, len(rule.Backends), rule.LBPolicy)
 	return rule, nil
@@ -226,13 +234,7 @@ func (e *Engine) UpdateRule(id string, rule *ProxyRule) (*ProxyRule, error) {
 		return nil, fmt.Errorf("push snapshot: %w", err)
 	}
 
-	e.mu.RLock()
-	_, stillThere := e.rules[id]
-	e.mu.RUnlock()
-	if !stillThere {
-		return nil, ErrRuleNotFound
-	}
-
+	e.notifyRulesChanged()
 	log.Printf("✏️  Rule updated: %s (%s)  %s:%d → %d backends [%s]",
 		rule.ID, rule.Name, rule.ListenAddr, rule.ListenPort, len(rule.Backends), rule.LBPolicy)
 	return rule, nil
@@ -259,6 +261,7 @@ func (e *Engine) DeleteRule(id string) error {
 		return fmt.Errorf("push snapshot: %w", err)
 	}
 
+	e.notifyRulesChanged()
 	log.Printf("➖ Rule deleted: %s", id)
 	return nil
 }

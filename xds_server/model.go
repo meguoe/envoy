@@ -64,8 +64,8 @@ type ProxyRule struct {
 
 // ─── 校验 ──────────────────────────────────────────────────────────────
 
-// ValidateRule 校验并规范化规则，返回 ValidationError 表示校验失败
-// ID 不在此校验（由 engine 层生成）
+// ValidateRule 校验规则，不修改输入参数
+// 返回 ValidationError 表示校验失败
 func ValidateRule(rule *ProxyRule) error {
 	if rule.Name == "" {
 		return &ValidationError{Msg: "name 不能为空"}
@@ -76,22 +76,20 @@ func ValidateRule(rule *ProxyRule) error {
 	if rule.ListenPort == 0 {
 		return &ValidationError{Msg: "listen_port 不能为空"}
 	}
+	if rule.ListenPort > 65535 {
+		return &ValidationError{Msg: "listen_port 超出范围 (1-65535)"}
+	}
 	if len(rule.Backends) == 0 {
 		return &ValidationError{Msg: "backends 不能为空，至少需要一个后端节点"}
 	}
 
-	if rule.Protocol == "" {
-		rule.Protocol = ProtocolHTTP
-	}
-	rule.Protocol = strings.ToLower(rule.Protocol)
-	if !validProtocols[rule.Protocol] {
+	protocol := strings.ToLower(rule.Protocol)
+	if rule.Protocol != "" && !validProtocols[protocol] {
 		return &ValidationError{Msg: "protocol 无效，可选值: http, udp"}
 	}
 
-	if rule.LBPolicy == "" {
-		return &ValidationError{Msg: "lb_policy 不能为空，可选值: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH"}
-	}
-	if !validLBPolicies[strings.ToUpper(rule.LBPolicy)] {
+	lbPolicy := strings.ToUpper(rule.LBPolicy)
+	if rule.LBPolicy != "" && !validLBPolicies[lbPolicy] {
 		return &ValidationError{Msg: "lb_policy 无效，可选值: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH"}
 	}
 
@@ -99,11 +97,27 @@ func ValidateRule(rule *ProxyRule) error {
 		if b.Address == "" || b.Port == 0 {
 			return &ValidationError{Msg: fmt.Sprintf("backends[%d]: address 和 port 不能为空", i)}
 		}
-		if b.Weight == 0 {
+	}
+
+	return nil
+}
+
+// NormalizeRule 规范化规则字段（设置默认值、统一大小写）
+// 调用方应确保规则已通过 ValidateRule 校验
+func NormalizeRule(rule *ProxyRule) {
+	if rule.Protocol == "" {
+		rule.Protocol = ProtocolHTTP
+	}
+	rule.Protocol = strings.ToLower(rule.Protocol)
+
+	if rule.LBPolicy == "" {
+		rule.LBPolicy = "ROUND_ROBIN"
+	}
+	rule.LBPolicy = strings.ToUpper(rule.LBPolicy)
+
+	for i := range rule.Backends {
+		if rule.Backends[i].Weight == 0 {
 			rule.Backends[i].Weight = 1
 		}
 	}
-
-	rule.LBPolicy = strings.ToUpper(rule.LBPolicy)
-	return nil
 }

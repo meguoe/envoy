@@ -44,6 +44,7 @@ func loadRules() ([]*xdsServer.ProxyRule, error) {
 			log.Printf("⚠️  跳过非法规则 #%d: %v", i, err)
 			continue
 		}
+		xdsServer.NormalizeRule(&list[i])
 		rules = append(rules, &list[i])
 	}
 	log.Printf("📁 已从文件加载 %d 条规则  path=%s", len(rules), storePath)

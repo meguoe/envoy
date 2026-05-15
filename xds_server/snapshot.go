@@ -1,12 +1,14 @@
 package xdsServer
 
 // snapshot.go —— 快照组装与推送到 Envoy
+//
+// Delta xDS 模式下，快照缓存通过 ConstructVersionMap() 构建
+// 每个资源的哈希版本映射，自动比对并只推送变更的资源，
+// 控制面无需再维护全局内容哈希做去重。
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
-	"hash"
 	"log"
 	"sort"
 	"sync/atomic"
@@ -14,7 +16,6 @@ import (
 	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
-	proto "google.golang.org/protobuf/proto"
 )
 
 // pushSnapshotLocked 构建快照并推送到 Envoy
@@ -39,12 +40,7 @@ func (e *Engine) pushSnapshotLocked() error {
 			log.Printf("🗑️  构建失败，移除规则: %s", name)
 		}
 		e.mu.Unlock()
-		// 通知外部持久化（非阻塞）
-		go func() {
-			if e.onRulesChanged != nil {
-				e.onRulesChanged()
-			}
-		}()
+		e.notifyRulesChanged()
 	}
 
 	// 排序组装
@@ -56,36 +52,7 @@ func (e *Engine) pushSnapshotLocked() error {
 
 	eps, cls, rts, lis := e.collectResources(names)
 
-	// SHA-256 去重
-	h := sha256.New()
-	for _, res := range eps {
-		if err := writeHash(h, res); err != nil {
-			return fmt.Errorf("hash endpoint: %w", err)
-		}
-	}
-	for _, res := range cls {
-		if err := writeHash(h, res); err != nil {
-			return fmt.Errorf("hash cluster: %w", err)
-		}
-	}
-	for _, res := range rts {
-		if err := writeHash(h, res); err != nil {
-			return fmt.Errorf("hash route: %w", err)
-		}
-	}
-	for _, res := range lis {
-		if err := writeHash(h, res); err != nil {
-			return fmt.Errorf("hash listener: %w", err)
-		}
-	}
-	newHash := fmt.Sprintf("%x", h.Sum(nil))
-
-	if newHash == e.lastContentHash {
-		log.Printf("📦 Snapshot unchanged, skip push  rules=%d", len(names))
-		return nil
-	}
-
-	// 推送
+	// 构建快照
 	resources := map[resourcev3.Type][]types.Resource{}
 	if len(eps) > 0 {
 		resources[resourcev3.EndpointType] = eps
@@ -106,23 +73,15 @@ func (e *Engine) pushSnapshotLocked() error {
 	if err != nil {
 		return fmt.Errorf("new snapshot: %w", err)
 	}
-
+	// 构建资源版本映射（Delta xDS 需要，用于比对每个资源的版本）
+	if err := snap.ConstructVersionMap(); err != nil {
+		return fmt.Errorf("construct version map: %w", err)
+	}
 	if err := e.snapCache.SetSnapshot(context.Background(), e.nodeID, snap); err != nil {
 		return fmt.Errorf("set snapshot: %w", err)
 	}
 
-	e.lastContentHash = newHash
-	log.Printf("📦 Snapshot pushed  ver=%s  rules=%d", version, len(names))
-	return nil
-}
-
-func writeHash(h hash.Hash, r types.Resource) error {
-	if msg, ok := r.(proto.Message); ok {
-		data, err := proto.MarshalOptions{Deterministic: true}.Marshal(msg)
-		if err != nil {
-			return fmt.Errorf("marshal resource: %w", err)
-		}
-		h.Write(data)
-	}
+	log.Printf("📦 Snapshot pushed  ver=%s  rules=%d  resources=[EDS=%d CDS=%d RDS=%d LDS=%d]",
+		version, len(names), len(eps), len(cls), len(rts), len(lis))
 	return nil
 }
