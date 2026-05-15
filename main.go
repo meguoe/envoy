@@ -75,10 +75,12 @@ func main() {
 	log.Printf("   HTTP (API)   %s", apiAddr)
 	log.Printf("   数据文件      %s", storePath)
 	log.Printf("")
+	log.Printf("   GET    /nodes          获取节点信息")
+	log.Printf("   GET    /health         服务健康检查")
+	log.Printf("   GET    /rules          获取规则列表")
 	log.Printf("   POST   /rules          创建代理规则")
-	log.Printf("   GET    /rules          列出所有规则")
-	log.Printf("   PUT    /rules/:name    更新规则")
-	log.Printf("   DELETE /rules/:name    删除规则")
+	log.Printf("   PUT    /rules/:name    更新代理规则")
+	log.Printf("   DELETE /rules/:name    删除代理规则")
 
 	// 6. 等待信号，优雅关闭
 	quit := make(chan os.Signal, 1)

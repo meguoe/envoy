@@ -19,6 +19,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	server "github.com/envoyproxy/go-control-plane/pkg/server/v3"
@@ -303,4 +304,38 @@ func (e *Engine) PushSnapshot() error {
 	e.pushMu.Lock()
 	defer e.pushMu.Unlock()
 	return e.pushSnapshotLocked()
+}
+
+// IsEnvoyConnected 检查是否有 Envoy 节点连接
+func (e *Engine) IsEnvoyConnected() bool {
+	info := e.snapCache.GetStatusInfo(e.nodeID)
+	return info != nil && info.GetNumWatches() > 0
+}
+
+// GetEnvoyNodes 返回所有已连接的 Envoy 节点信息
+func (e *Engine) GetEnvoyNodes() []map[string]any {
+	var nodes []map[string]any
+	for _, key := range e.snapCache.GetStatusKeys() {
+		info := e.snapCache.GetStatusInfo(key)
+		if info == nil {
+			continue
+		}
+		node := info.GetNode()
+		entry := map[string]any{
+			"node_id":             key,
+			"watches":             info.GetNumWatches(),
+			"delta_watches":       info.GetNumDeltaWatches(),
+			"last_request_time":   info.GetLastWatchRequestTime().Format(time.RFC3339),
+			"last_delta_req_time": info.GetLastDeltaWatchRequestTime().Format(time.RFC3339),
+		}
+		if node != nil {
+			entry["id"] = node.GetId()
+			entry["cluster"] = node.GetCluster()
+			entry["user_agent"] = node.GetUserAgentName()
+			entry["version"] = node.GetUserAgentVersion()
+			entry["listening_addresses"] = node.GetListeningAddresses()
+		}
+		nodes = append(nodes, entry)
+	}
+	return nodes
 }

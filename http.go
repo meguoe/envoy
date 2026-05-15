@@ -69,6 +69,34 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func buildHTTPMux() http.Handler {
 	mux := http.NewServeMux()
 
+	// 健康检查
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			respErr(w, 405, "GET")
+			return
+		}
+		envoyConnected := engine.IsEnvoyConnected()
+		writeJSON(w, 200, map[string]any{
+			"code":    200,
+			"success": true,
+			"message": "ok",
+			"data": map[string]any{
+				"status":          "up",
+				"rules":           len(engine.ListRules()),
+				"envoy_connected": envoyConnected,
+			},
+		})
+	})
+
+	// Envoy 节点信息
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			respErr(w, 405, "GET")
+			return
+		}
+		respOK(w, engine.GetEnvoyNodes())
+	})
+
 	mux.HandleFunc("/rules", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
