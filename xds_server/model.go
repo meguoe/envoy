@@ -62,6 +62,21 @@ type ProxyRule struct {
 	LBPolicy   string        `json:"lb_policy"`
 }
 
+// ─── Envoy 节点信息 ────────────────────────────────────────────────────
+
+// EnvoyNodeInfo 表示一个已连接的 Envoy 节点
+type EnvoyNodeInfo struct {
+	NodeID           string `json:"node_id"`
+	ID               string `json:"id,omitempty"`
+	Cluster          string `json:"cluster,omitempty"`
+	UserAgent        string `json:"user_agent,omitempty"`
+	Version          string `json:"version,omitempty"`
+	Watches          int    `json:"watches"`
+	DeltaWatches     int    `json:"delta_watches"`
+	LastRequestTime  string `json:"last_request_time"`
+	LastDeltaReqTime string `json:"last_delta_req_time"`
+}
+
 // ─── 校验 ──────────────────────────────────────────────────────────────
 
 // ValidateRule 校验规则，不修改输入参数

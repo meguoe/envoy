@@ -24,7 +24,7 @@ func loadRules() ([]*xdsServer.ProxyRule, error) {
 	data, err := os.ReadFile(storePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("📁 数据文件不存在，从空状态启动  path=%s", storePath)
+			log.Printf("数据文件不存在，从空状态启动  path=%s", storePath)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -41,13 +41,19 @@ func loadRules() ([]*xdsServer.ProxyRule, error) {
 	rules := make([]*xdsServer.ProxyRule, 0, len(list))
 	for i := range list {
 		if err := xdsServer.ValidateRule(&list[i]); err != nil {
-			log.Printf("⚠️  跳过非法规则 #%d: %v", i, err)
+			log.Printf("跳过非法规则 #%d: %v", i, err)
 			continue
 		}
 		xdsServer.NormalizeRule(&list[i])
 		rules = append(rules, &list[i])
 	}
-	log.Printf("📁 已从文件加载 %d 条规则  path=%s", len(rules), storePath)
+
+	// 与 saveRules 保持一致：按 ID 排序
+	sort.Slice(rules, func(i, j int) bool {
+		return rules[i].ID < rules[j].ID
+	})
+
+	log.Printf("已从文件加载 %d 条规则  path=%s", len(rules), storePath)
 	return rules, nil
 }
 

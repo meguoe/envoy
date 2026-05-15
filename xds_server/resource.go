@@ -93,7 +93,7 @@ func buildHTTPRule(rule *ProxyRule) (*ruleRes, error) {
 	// LDS
 	routerAny, err := mustAny(&router.Router{})
 	if err != nil {
-		return nil, fmt.Errorf("build router any: %w", err)
+		return nil, fmt.Errorf("序列化 Router 过滤器配置失败: %w", err)
 	}
 	hcmAny, err := mustAny(&hcm.HttpConnectionManager{
 		StatPrefix: "ingress_" + rule.Name,
@@ -112,7 +112,7 @@ func buildHTTPRule(rule *ProxyRule) (*ruleRes, error) {
 		}},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build hcm any: %w", err)
+		return nil, fmt.Errorf("序列化 HTTP 连接管理器配置失败: %w", err)
 	}
 
 	li := &listener.Listener{
@@ -166,7 +166,7 @@ func buildUDPRule(rule *ProxyRule) (*ruleRes, error) {
 
 	udpRouteAny, err := mustAny(&udpproxy.Route{Cluster: clusterName})
 	if err != nil {
-		return nil, fmt.Errorf("build udp route any: %w", err)
+		return nil, fmt.Errorf("序列化 UDP 路由配置失败: %w", err)
 	}
 	udpProxyAny, err := mustAny(&udpproxy.UdpProxyConfig{
 		StatPrefix: "ingress_" + rule.Name,
@@ -185,7 +185,7 @@ func buildUDPRule(rule *ProxyRule) (*ruleRes, error) {
 		IdleTimeout: durationpb.New(60 * time.Second),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build udp proxy any: %w", err)
+		return nil, fmt.Errorf("序列化 UDP 代理配置失败: %w", err)
 	}
 
 	li := &listener.Listener{

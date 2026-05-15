@@ -54,14 +54,15 @@ var ErrRuleNotFound = errors.New("rule not found")
 
 // Engine xDS 引擎，封装所有 xDS 状态
 type Engine struct {
-	nodeID         string
-	snapCache      cache.SnapshotCache
-	rules          map[string]*ProxyRule
-	resCache       map[string]*ruleRes // 注意: 仅在 pushMu 保护下读写, 不可并发访问
-	versionSeq     uint64
-	mu             sync.RWMutex // 保护 rules
-	pushMu         sync.Mutex   // 串行化「修改 + 推送」
-	onRulesChanged func()
+	nodeID          string
+	snapCache       cache.SnapshotCache
+	rules           map[string]*ProxyRule
+	resCache        map[string]*ruleRes // 注意: 仅在 pushMu 保护下读写, 不可并发访问
+	versionSeq      uint64
+	persistFailures uint64       // 持久化连续失败计数
+	mu              sync.RWMutex // 保护 rules
+	pushMu          sync.Mutex   // 串行化「修改 + 推送」
+	onRulesChanged  func() error
 }
 
 // NewEngine 创建 xDS 引擎
@@ -74,16 +75,27 @@ func NewEngine(nodeID string) *Engine {
 	}
 }
 
-// SetOnRulesChanged 设置规则变更后的持久化回调
-// 每次 CRUD 成功并推送快照后自动调用
-func (e *Engine) SetOnRulesChanged(fn func()) {
+// SetOnRulesChanged 设置规则变更后的持久化回调（同步调用）
+// 每次 CRUD 成功并推送快照后自动调用，返回 error 表示持久化失败
+func (e *Engine) SetOnRulesChanged(fn func() error) {
 	e.onRulesChanged = fn
 }
 
-// notifyRulesChanged 非阻塞通知持久化
+// notifyRulesChanged 同步执行持久化回调
+// 在 pushMu 保护下、快照推送成功后调用
+// 持久化失败不回滚（Envoy 已收到新配置），但记录失败计数并告警
 func (e *Engine) notifyRulesChanged() {
-	if e.onRulesChanged != nil {
-		go e.onRulesChanged()
+	if e.onRulesChanged == nil {
+		return
+	}
+	if err := e.onRulesChanged(); err != nil {
+		e.persistFailures++
+		log.Printf("持久化失败 (累计 %d 次): %v", e.persistFailures, err)
+		if e.persistFailures >= 3 {
+			log.Printf("警告: 持久化已连续失败 %d 次，内存规则与文件可能不一致", e.persistFailures)
+		}
+	} else {
+		e.persistFailures = 0
 	}
 }
 
@@ -105,9 +117,9 @@ func (e *Engine) NewGRPCServer() *grpc.Server {
 func (e *Engine) StartGRPC(addr string, gs *grpc.Server) error {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen gRPC: %w", err)
+		return fmt.Errorf("监听 gRPC 失败: %w", err)
 	}
-	log.Printf("xDS gRPC on %s", addr)
+	log.Printf("xDS gRPC 启动 %s", addr)
 	return gs.Serve(lis)
 }
 
@@ -152,11 +164,11 @@ func (e *Engine) SetRules(list []*ProxyRule) {
 	defer e.mu.Unlock()
 	for _, r := range list {
 		if err := e.checkNameConflict(r); err != nil {
-			log.Printf("⚠️  跳过名称冲突规则 %s: %v", r.ID, err)
+			log.Printf("跳过名称冲突规则 %s: %v", r.ID, err)
 			continue
 		}
 		if err := e.checkPortConflict(r); err != nil {
-			log.Printf("⚠️  跳过端口冲突规则 %s: %v", r.ID, err)
+			log.Printf("跳过端口冲突规则 %s: %v", r.ID, err)
 			continue
 		}
 		e.rules[r.ID] = r
@@ -191,11 +203,11 @@ func (e *Engine) CreateRule(rule *ProxyRule) (*ProxyRule, error) {
 		e.mu.Lock()
 		delete(e.rules, rule.ID)
 		e.mu.Unlock()
-		return nil, fmt.Errorf("push snapshot: %w", err)
+		return nil, fmt.Errorf("推送快照失败: %w", err)
 	}
 
 	e.notifyRulesChanged()
-	log.Printf("➕ Rule created: %s (%s)  %s:%d → %d backends [%s]",
+	log.Printf("创建规则: %s (%s)  %s:%d -> %d 后端 [%s]",
 		rule.ID, rule.Name, rule.ListenAddr, rule.ListenPort, len(rule.Backends), rule.LBPolicy)
 	return rule, nil
 }
@@ -234,11 +246,11 @@ func (e *Engine) UpdateRule(id string, rule *ProxyRule) (*ProxyRule, error) {
 			e.rules[id] = oldRule
 		}
 		e.mu.Unlock()
-		return nil, fmt.Errorf("push snapshot: %w", err)
+		return nil, fmt.Errorf("推送快照失败: %w", err)
 	}
 
 	e.notifyRulesChanged()
-	log.Printf("✏️  Rule updated: %s (%s)  %s:%d → %d backends [%s]",
+	log.Printf("更新规则: %s (%s)  %s:%d -> %d 后端 [%s]",
 		rule.ID, rule.Name, rule.ListenAddr, rule.ListenPort, len(rule.Backends), rule.LBPolicy)
 	return rule, nil
 }
@@ -261,11 +273,11 @@ func (e *Engine) DeleteRule(id string) error {
 		e.mu.Lock()
 		e.rules[id] = oldRule
 		e.mu.Unlock()
-		return fmt.Errorf("push snapshot: %w", err)
+		return fmt.Errorf("推送快照失败: %w", err)
 	}
 
 	e.notifyRulesChanged()
-	log.Printf("➖ Rule deleted: %s", id)
+	log.Printf("删除规则: %s", id)
 	return nil
 }
 
@@ -318,10 +330,15 @@ func (e *Engine) IsEnvoyConnected() bool {
 	return info != nil && info.GetNumWatches() > 0
 }
 
+// PersistFailures 返回持久化连续失败次数
+func (e *Engine) PersistFailures() uint64 {
+	return e.persistFailures
+}
+
 // GetEnvoyNodes 返回所有已连接的 Envoy 节点信息
 // 仅返回持有活跃 gRPC watch 的节点（watches > 0 || delta_watches > 0）
-func (e *Engine) GetEnvoyNodes() []map[string]any {
-	var nodes []map[string]any
+func (e *Engine) GetEnvoyNodes() []EnvoyNodeInfo {
+	var nodes []EnvoyNodeInfo
 	for _, key := range e.snapCache.GetStatusKeys() {
 		info := e.snapCache.GetStatusInfo(key)
 		if info == nil {
@@ -331,19 +348,18 @@ func (e *Engine) GetEnvoyNodes() []map[string]any {
 		if info.GetNumWatches() == 0 && info.GetNumDeltaWatches() == 0 {
 			continue
 		}
-		node := info.GetNode()
-		entry := map[string]any{
-			"node_id":             key,
-			"watches":             info.GetNumWatches(),
-			"delta_watches":       info.GetNumDeltaWatches(),
-			"last_request_time":   info.GetLastWatchRequestTime().Format(time.RFC3339),
-			"last_delta_req_time": info.GetLastDeltaWatchRequestTime().Format(time.RFC3339),
+		entry := EnvoyNodeInfo{
+			NodeID:           key,
+			Watches:          info.GetNumWatches(),
+			DeltaWatches:     info.GetNumDeltaWatches(),
+			LastRequestTime:  info.GetLastWatchRequestTime().Format(time.RFC3339),
+			LastDeltaReqTime: info.GetLastDeltaWatchRequestTime().Format(time.RFC3339),
 		}
-		if node != nil {
-			entry["id"] = node.GetId()
-			entry["cluster"] = node.GetCluster()
-			entry["user_agent"] = node.GetUserAgentName()
-			entry["version"] = node.GetUserAgentVersion()
+		if node := info.GetNode(); node != nil {
+			entry.ID = node.GetId()
+			entry.Cluster = node.GetCluster()
+			entry.UserAgent = node.GetUserAgentName()
+			entry.Version = node.GetUserAgentVersion()
 		}
 		nodes = append(nodes, entry)
 	}

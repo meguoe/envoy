@@ -65,13 +65,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // ─── HTTP 路由 ─────────────────────────────────────────────────────────
 
-func buildHTTPMux() http.Handler {
+func buildHTTPMux(engine *xdsServer.Engine) http.Handler {
 	mux := http.NewServeMux()
 
 	// 健康检查
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			respErr(w, 405, "GET")
+			respErr(w, 405, "仅支持 GET")
 			return
 		}
 		envoyConnected := engine.IsEnvoyConnected()
@@ -80,9 +80,10 @@ func buildHTTPMux() http.Handler {
 			"success": true,
 			"message": "ok",
 			"data": map[string]any{
-				"status":          "up",
-				"rules":           len(engine.ListRules()),
-				"envoy_connected": envoyConnected,
+				"status":           "up",
+				"rules":            len(engine.ListRules()),
+				"envoy_connected":  envoyConnected,
+				"persist_failures": engine.PersistFailures(),
 			},
 		})
 	})
@@ -90,7 +91,7 @@ func buildHTTPMux() http.Handler {
 	// Envoy 节点信息
 	mux.HandleFunc("/nodes", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			respErr(w, 405, "GET")
+			respErr(w, 405, "仅支持 GET")
 			return
 		}
 		respOK(w, engine.GetEnvoyNodes())
@@ -99,36 +100,36 @@ func buildHTTPMux() http.Handler {
 	mux.HandleFunc("/rules", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
-			handleCreate(w, r)
+			handleCreate(w, r, engine)
 		case http.MethodGet:
-			handleList(w)
+			handleList(w, engine)
 		default:
-			respErr(w, 405, "POST or GET")
+			respErr(w, 405, "仅支持 POST 或 GET")
 		}
 	})
 
 	mux.HandleFunc("/rules/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/rules/")
 		if id == "" {
-			respErr(w, 400, "missing rule id")
+			respErr(w, 400, "缺少规则 ID")
 			return
 		}
 		switch r.Method {
 		case http.MethodGet:
-			handleGetOne(w, id)
+			handleGetOne(w, id, engine)
 		case http.MethodPut:
-			handleUpdate(w, r, id)
+			handleUpdate(w, r, id, engine)
 		case http.MethodDelete:
-			handleDelete(w, id)
+			handleDelete(w, id, engine)
 		default:
-			respErr(w, 405, "GET, PUT or DELETE")
+			respErr(w, 405, "仅支持 GET、PUT 或 DELETE")
 		}
 	})
 
 	return mux
 }
 
-func handleCreate(w http.ResponseWriter, r *http.Request) {
+func handleCreate(w http.ResponseWriter, r *http.Request, engine *xdsServer.Engine) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var rule xdsServer.ProxyRule
 	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
@@ -151,16 +152,16 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	respCreated(w, created)
 }
 
-func handleGetOne(w http.ResponseWriter, id string) {
+func handleGetOne(w http.ResponseWriter, id string, engine *xdsServer.Engine) {
 	rule, ok := engine.GetRule(id)
 	if !ok {
-		respErr(w, 404, "rule not found")
+		respErr(w, 404, "规则不存在")
 		return
 	}
 	respOK(w, rule)
 }
 
-func handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
+func handleUpdate(w http.ResponseWriter, r *http.Request, id string, engine *xdsServer.Engine) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var rule xdsServer.ProxyRule
 	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
@@ -173,7 +174,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
 	// 获取已有规则
 	old, ok := engine.GetRule(id)
 	if !ok {
-		respErr(w, 404, "rule not found")
+		respErr(w, 404, "规则不存在")
 		return
 	}
 
@@ -219,11 +220,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
 	respOK(w, updated)
 }
 
-func handleList(w http.ResponseWriter) {
+func handleList(w http.ResponseWriter, engine *xdsServer.Engine) {
 	respOK(w, engine.ListRules())
 }
 
-func handleDelete(w http.ResponseWriter, id string) {
+func handleDelete(w http.ResponseWriter, id string, engine *xdsServer.Engine) {
 	if err := engine.DeleteRule(id); err != nil {
 		status := 500
 		if errors.Is(err, xdsServer.ErrRuleNotFound) {

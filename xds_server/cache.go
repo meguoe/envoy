@@ -29,7 +29,7 @@ func (e *Engine) syncResCache(current map[string]*ProxyRule) []string {
 		if !ok || cached.owner != rule {
 			res, err := buildOneRule(rule)
 			if err != nil {
-				log.Printf("⚠️  构建资源失败 name=%s: %v", name, err)
+				log.Printf("构建资源失败 name=%s: %v", name, err)
 				failed = append(failed, name)
 				delete(e.resCache, name)
 				continue

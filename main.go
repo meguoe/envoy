@@ -33,10 +33,8 @@ var (
 func main() {
 	// 1. 创建 xDS 引擎
 	engine = xdsServer.NewEngine("envoy-local")
-	engine.SetOnRulesChanged(func() {
-		if err := saveRules(engine.ListRules()); err != nil {
-			log.Printf("⚠️  自动持久化失败: %v", err)
-		}
+	engine.SetOnRulesChanged(func() error {
+		return saveRules(engine.ListRules())
 	})
 
 	// 2. 从文件加载历史规则
@@ -52,45 +50,45 @@ func main() {
 	grpcSrv = engine.NewGRPCServer()
 	go func() {
 		if err := engine.StartGRPC(grpcAddr, grpcSrv); err != nil {
-			log.Fatalf("gRPC serve: %v", err)
+			log.Fatalf("gRPC 服务异常: %v", err)
 		}
 	}()
 
 	// 4. 启动 HTTP API 服务器
-	httpSrv = &http.Server{Addr: apiAddr, Handler: buildHTTPMux()}
+	httpSrv = &http.Server{Addr: apiAddr, Handler: buildHTTPMux(engine)}
 	go func() {
-		log.Printf("HTTP API on %s", apiAddr)
+		log.Printf("HTTP API 启动 %s", apiAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP serve: %v", err)
+			log.Fatalf("HTTP 服务异常: %v", err)
 		}
 	}()
 
 	// 5. 推送初始快照
 	if err := engine.PushSnapshot(); err != nil {
-		log.Fatalf("initial snapshot: %v", err)
+		log.Fatalf("初始快照推送失败: %v", err)
 	}
 
-	log.Printf("✅ xDS control-plane ready")
-	log.Printf("   gRPC (ADS)   %s", grpcAddr)
-	log.Printf("   HTTP (API)   %s", apiAddr)
-	log.Printf("   数据文件      %s", storePath)
+	log.Printf("xDS 控制面就绪")
+	log.Printf("  gRPC (ADS)  %s", grpcAddr)
+	log.Printf("  HTTP (API)  %s", apiAddr)
+	log.Printf("  数据文件     %s", storePath)
 	log.Printf("")
-	log.Printf("   GET    /nodes          获取节点信息")
-	log.Printf("   GET    /health         服务健康检查")
-	log.Printf("   GET    /rules          获取规则列表")
-	log.Printf("   POST   /rules          创建代理规则")
-	log.Printf("   PUT    /rules/:name    更新代理规则")
-	log.Printf("   DELETE /rules/:name    删除代理规则")
+	log.Printf("  GET    /nodes          获取已连接的 Envoy 节点")
+	log.Printf("  GET    /health         健康检查")
+	log.Printf("  GET    /rules          获取规则列表")
+	log.Printf("  POST   /rules          创建代理规则")
+	log.Printf("  PUT    /rules/:id      更新代理规则")
+	log.Printf("  DELETE /rules/:id      删除代理规则")
 
 	// 6. 等待信号，优雅关闭
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
-	log.Printf("🛑 收到信号 %v，正在关闭...", sig)
+	log.Printf("收到信号 %v，正在关闭...", sig)
 
 	// 最终持久化一次
 	if err := saveRules(engine.ListRules()); err != nil {
-		log.Printf("⚠️  关闭前持久化失败: %v", err)
+		log.Printf("关闭前持久化失败: %v", err)
 	}
 
 	// 给进行中的请求 5 秒完成时间
@@ -99,9 +97,9 @@ func main() {
 
 	// HTTP 优雅关闭
 	if err := httpSrv.Shutdown(ctx); err != nil {
-		log.Printf("⚠️  HTTP 关闭失败: %v", err)
+		log.Printf("HTTP 关闭失败: %v", err)
 	} else {
-		log.Printf("✅ HTTP 已关闭")
+		log.Printf("HTTP 已关闭")
 	}
 
 	// gRPC 优雅关闭（ADS 长连接可能无法自然结束，超时后强制关闭）
@@ -112,10 +110,10 @@ func main() {
 	}()
 	select {
 	case <-done:
-		log.Printf("✅ gRPC 已关闭")
+		log.Printf("gRPC 已关闭")
 	case <-time.After(3 * time.Second):
 		grpcSrv.Stop()
 	}
 
-	log.Printf("👋 Bye!")
+	log.Printf("服务已停止")
 }

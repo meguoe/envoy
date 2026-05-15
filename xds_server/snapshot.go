@@ -37,7 +37,7 @@ func (e *Engine) pushSnapshotLocked() error {
 		e.mu.Lock()
 		for _, name := range failedRules {
 			delete(e.rules, name)
-			log.Printf("🗑️  构建失败，移除规则: %s", name)
+			log.Printf("构建失败，移除规则: %s", name)
 		}
 		e.mu.Unlock()
 		e.notifyRulesChanged()
@@ -71,17 +71,17 @@ func (e *Engine) pushSnapshotLocked() error {
 
 	snap, err := cache.NewSnapshot(version, resources)
 	if err != nil {
-		return fmt.Errorf("new snapshot: %w", err)
+		return fmt.Errorf("创建快照失败: %w", err)
 	}
 	// 构建资源版本映射（Delta xDS 需要，用于比对每个资源的版本）
 	if err := snap.ConstructVersionMap(); err != nil {
-		return fmt.Errorf("construct version map: %w", err)
+		return fmt.Errorf("构建版本映射失败: %w", err)
 	}
 	if err := e.snapCache.SetSnapshot(context.Background(), e.nodeID, snap); err != nil {
-		return fmt.Errorf("set snapshot: %w", err)
+		return fmt.Errorf("设置快照失败: %w", err)
 	}
 
-	log.Printf("📦 Snapshot pushed  ver=%s  rules=%d  resources=[EDS=%d CDS=%d RDS=%d LDS=%d]",
+	log.Printf("快照推送完成  ver=%s  rules=%d  resources=[EDS=%d CDS=%d RDS=%d LDS=%d]",
 		version, len(names), len(eps), len(cls), len(rts), len(lis))
 	return nil
 }
