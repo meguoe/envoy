@@ -205,6 +205,7 @@ func (e *Engine) UpdateRule(id string, rule *ProxyRule) (*ProxyRule, error) {
 	if err := ValidateRule(rule); err != nil {
 		return nil, err
 	}
+	NormalizeRule(rule)
 
 	e.pushMu.Lock()
 	defer e.pushMu.Unlock()

@@ -180,15 +180,20 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
 	// Name: 默认继承，不允许变更
 	rule.Name = old.Name
 
+	// ListenPort: 0 表示未传，继承旧值；非 0 则严格校验范围
+	if rule.ListenPort == 0 {
+		rule.ListenPort = old.ListenPort
+	} else if rule.ListenPort < 10 || rule.ListenPort > 65534 {
+		respErr(w, 400, "listen_port 超出范围 (10-65534)")
+		return
+	}
+
 	// 未传字段继承旧值
 	if rule.Protocol == "" {
 		rule.Protocol = old.Protocol
 	}
 	if rule.ListenAddr == "" {
 		rule.ListenAddr = old.ListenAddr
-	}
-	if rule.ListenPort == 0 {
-		rule.ListenPort = old.ListenPort
 	}
 	if rule.LBPolicy == "" {
 		rule.LBPolicy = old.LBPolicy

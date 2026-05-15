@@ -67,9 +67,9 @@ type ProxyRule struct {
 // ValidateRule 校验规则，不修改输入参数
 // 返回 ValidationError 表示校验失败
 //
-// 注意: ListenPort == 0 会被拦截。对于 UpdateRule 场景，
-// 调用方应在 ValidateRule 之前将未传字段合并旧值（如 handleUpdate），
-// 避免 0 值被误判为"未传"而非"非法"。
+// 注意: ListenPort 校验范围为 10-65534。
+// 对于 UpdateRule 场景，调用方应先处理 ListenPort==0 的继承逻辑再调用 ValidateRule，
+// 或在 HTTP 层对 ListenPort 做前置校验（如 handleUpdate）。
 func ValidateRule(rule *ProxyRule) error {
 	if rule.Name == "" {
 		return &ValidationError{Msg: "name 不能为空"}
@@ -77,11 +77,8 @@ func ValidateRule(rule *ProxyRule) error {
 	if rule.ListenAddr == "" {
 		return &ValidationError{Msg: "listen_addr 不能为空"}
 	}
-	if rule.ListenPort == 0 {
-		return &ValidationError{Msg: "listen_port 不能为空"}
-	}
-	if rule.ListenPort > 65535 {
-		return &ValidationError{Msg: "listen_port 超出范围 (1-65535)"}
+	if rule.ListenPort < 10 || rule.ListenPort > 65534 {
+		return &ValidationError{Msg: "listen_port 超出范围 (10-65534)"}
 	}
 	if len(rule.Backends) == 0 {
 		return &ValidationError{Msg: "backends 不能为空，至少需要一个后端节点"}
