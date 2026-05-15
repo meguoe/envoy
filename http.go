@@ -146,6 +146,33 @@ func handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
 	// body 中的 ID 忽略，以 URL 为准
 	rule.ID = ""
 
+	// 获取已有规则
+	old, ok := engine.GetRule(id)
+	if !ok {
+		respErr(w, 404, "rule not found")
+		return
+	}
+
+	// Name: 默认继承，不允许变更
+	rule.Name = old.Name
+
+	// 未传字段继承旧值
+	if rule.Protocol == "" {
+		rule.Protocol = old.Protocol
+	}
+	if rule.ListenAddr == "" {
+		rule.ListenAddr = old.ListenAddr
+	}
+	if rule.ListenPort == 0 {
+		rule.ListenPort = old.ListenPort
+	}
+	if rule.LBPolicy == "" {
+		rule.LBPolicy = old.LBPolicy
+	}
+	if len(rule.Backends) == 0 {
+		rule.Backends = old.Backends
+	}
+
 	updated, err := engine.UpdateRule(id, &rule)
 	if err != nil {
 		status := 500

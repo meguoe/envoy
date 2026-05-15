@@ -102,9 +102,19 @@ func main() {
 		log.Printf("✅ HTTP 已关闭")
 	}
 
-	// gRPC 优雅关闭
-	grpcSrv.GracefulStop()
-	log.Printf("✅ gRPC 已关闭")
+	// gRPC 优雅关闭（ADS 长连接可能无法自然结束，超时后强制关闭）
+	done := make(chan struct{})
+	go func() {
+		grpcSrv.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("✅ gRPC 已关闭")
+	case <-time.After(3 * time.Second):
+		log.Printf("⚠️  gRPC 优雅关闭超时，强制关闭")
+		grpcSrv.Stop()
+	}
 
 	log.Printf("👋 Bye!")
 }

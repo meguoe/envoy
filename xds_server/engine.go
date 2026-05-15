@@ -104,6 +104,22 @@ func (e *Engine) StartGRPC(addr string, gs *grpc.Server) error {
 
 // ─── CRUD 操作 ─────────────────────────────────────────────────────────
 
+// checkNameConflict 检查规则名是否被其他规则占用
+// 调用方必须持有 e.mu
+func (e *Engine) checkNameConflict(rule *ProxyRule) *ValidationError {
+	for _, r := range e.rules {
+		if r.ID == rule.ID {
+			continue
+		}
+		if r.Name == rule.Name {
+			return &ValidationError{
+				Msg: fmt.Sprintf("规则名 %q 已被规则 %s 占用", rule.Name, r.ID),
+			}
+		}
+	}
+	return nil
+}
+
 // checkPortConflict 检查 listen_addr:listen_port + protocol 是否被其他规则占用
 // 调用方必须持有 e.mu
 func (e *Engine) checkPortConflict(rule *ProxyRule) *ValidationError {
@@ -126,6 +142,10 @@ func (e *Engine) SetRules(list []*ProxyRule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, r := range list {
+		if err := e.checkNameConflict(r); err != nil {
+			log.Printf("⚠️  跳过名称冲突规则 %s: %v", r.ID, err)
+			continue
+		}
 		if err := e.checkPortConflict(r); err != nil {
 			log.Printf("⚠️  跳过端口冲突规则 %s: %v", r.ID, err)
 			continue
@@ -146,6 +166,10 @@ func (e *Engine) CreateRule(rule *ProxyRule) (*ProxyRule, error) {
 	defer e.pushMu.Unlock()
 
 	e.mu.Lock()
+	if err := e.checkNameConflict(rule); err != nil {
+		e.mu.Unlock()
+		return nil, err
+	}
 	if err := e.checkPortConflict(rule); err != nil {
 		e.mu.Unlock()
 		return nil, err
@@ -181,6 +205,10 @@ func (e *Engine) UpdateRule(id string, rule *ProxyRule) (*ProxyRule, error) {
 		return nil, ErrRuleNotFound
 	}
 	rule.ID = id
+	if err := e.checkNameConflict(rule); err != nil {
+		e.mu.Unlock()
+		return nil, err
+	}
 	if err := e.checkPortConflict(rule); err != nil {
 		e.mu.Unlock()
 		return nil, err
