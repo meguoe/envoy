@@ -1,277 +1,272 @@
 # Envoy xDS 动态代理控制面
-https://github.com/meguoe/envoy.git
-通过 HTTP API 动态创建/删除代理规则，实时生效，零重启。
 
-## 架构
+一个小型 Go xDS control plane。通过 HTTP API 写入代理规则，控制面生成 Envoy v3 xDS 资源并通过 Delta ADS 推送给 Envoy。
 
-```
-┌─────────────┐         ┌────────────────────┐         ┌──────────────┐
-│   Client    │         │    Envoy Proxy     │         │  Upstream    │
-│             │◀═══════▶│  :9000, :9001 ...  │◀═══════▶│  :8081 ...   │
-└─────────────┘         └────────┬───────────┘         └──────────────┘
-                                 │
-                                 │ ADS gRPC stream
-                                 ▼
-                       ┌────────────────────┐
-                       │   xDS Server       │
-                       │ gRPC :18000 (ADS)  │
-                       │ HTTP :18001 (API)  │◀── 管理代理规则
-                       └────────────────────┘
+Envoy API 文档：https://www.envoyproxy.io/docs/envoy/v1.38.3/api-v3/api
+
+## 当前能力
+
+- 支持 HTTP 代理规则：LDS + RDS + CDS + EDS。
+- 支持 UDP 代理规则：LDS + STATIC CDS。
+- Envoy 到控制面使用 gRPC mTLS。
+- HTTP 管理 API 支持 HTTPS、IP 白名单、`X-API-KEY`、速率限制、请求体大小限制。
+- 规则持久化到 JSON 文件，启动时加载，非法规则会跳过。
+- 暴露 `/health`、`/nodes`、`/metrics`。
+
+不支持：域名路由、多路由匹配、TLS 下游终止、Web UI、数据库存储。
+
+## 目录结构
+
+```text
+cmd/control-plane/main.go       # 启动、配置加载、服务器生命周期
+internal/config/                # config.yaml 加载和校验
+internal/store/                 # JSON 持久化
+internal/server/http/           # 管理 API、认证、限流、日志、metrics
+internal/server/xds/            # 规则模型、xDS 引擎、资源构建、mTLS
+config.yaml                     # 控制面配置
+envoy.yaml                      # 本地 Envoy bootstrap
+tools/generate-certs.sh         # 本地测试证书生成
 ```
 
 ## 快速开始
 
 ```bash
-# 启动 xDS 控制面
-go mod tidy && go run .
-
-# 启动 Envoy
+./tools/generate-certs.sh
+go run ./cmd/control-plane
 envoy -c envoy.yaml --log-level info
 ```
 
-# Envoy 配置
-
-```yaml
-# envoy.yaml (minimal bootstrap)
-admin:
-  address:
-    socket_address: { address: 0.0.0.0, port_value: 9901 }
-
-dynamic_resources:
-  ads_config:
-    api_type: GRPC
-    transport_api_version: V3
-    grpc_services:
-      - envoy_grpc:
-          cluster_name: xds-cluster
-  lds_config:
-    ads: {}
-  cds_config:
-    ads: {}
-
-static_resources:
-  clusters:
-    - name: xds-cluster
-      type: STATIC
-      connect_timeout: 1s
-      typed_extension_protocol_options:
-        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
-          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-          explicit_http_config:
-            http2_protocol_options: {}
-      load_assignment:
-        cluster_name: xds-cluster
-        endpoints:
-          - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address: { address: 127.0.0.1, port_value: 18000 }
-
-```
-
-## API 接口
-
-### 创建代理规则
+当前 `config.yaml` 开启了 HTTPS，所以管理 API 默认使用：
 
 ```bash
-POST /rules
-Content-Type: application/json
-
-{
-  "name":           "web",                # 规则名称（唯一标识）
-  "listen_port":    9981,                 # Envoy 监听端口
-  "listen_addr":    "0.0.0.0",          # Envoy 监听地址
-  "backends": [
-    {
-      "address":  "124.236.16.69",      # 上游地址
-      "port": 7073,                     # 上游端口
-      "weight": 1                       # 加权负载均衡权重，0 等效于 1
-    }
-  ],
-  "lb_policy":      "ROUND_ROBIN"       # 轮询策略
-}
+curl -k https://127.0.0.1:18000/health
 ```
 
-支持的 `lb_policy`：
-| 值 | 说明 |
-|---|------|
-| `ROUND_ROBIN` | 轮询（默认） |
-| `LEAST_REQUEST` | 最少连接 |
-| `RANDOM` | 随机 |
-| `RING_HASH` | 一致性哈希 |
+如果把 `https.enabled` 改成 `false`，再使用：
 
-响应：
+```bash
+curl http://127.0.0.1:18000/health
+```
+
+## 编译和检查
+
+```bash
+go build -o xds-control-plane ./cmd/control-plane
+go test ./...
+go vet ./...
+```
+
+如果本地沙箱限制 Go 默认 cache：
+
+```bash
+GOCACHE=/private/tmp/envoy-go-cache go test ./...
+GOCACHE=/private/tmp/envoy-go-cache go build -o xds-control-plane ./cmd/control-plane
+```
+
+## 启动参数
+
+```bash
+go run ./cmd/control-plane -config config.yaml
+go run ./cmd/control-plane -json-log
+```
+
+- `-config`：指定配置文件，默认 `config.yaml`。
+- `-json-log`：HTTP 访问日志输出 JSON。
+
+## 配置
+
+当前配置以 `config.yaml` 为准。README 只说明字段语义，不复制配置内容。
+
+- `api_addr` 是管理 API 地址。
+- `grpc_addr` 是 Envoy xDS ADS 地址。
+- `store_path` 是规则持久化文件。
+- `log_level` 控制普通日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`。
+- `max_body_bytes` 限制管理 API 请求体大小。
+- `connect_timeout` 用于生成 Envoy cluster 的连接超时。
+- `udp_idle_timeout` 用于 UDP proxy idle timeout。
+- `rate_limit.rps` 和 `rate_limit.burst` 控制每个客户端 IP 的令牌桶限流。
+- `http_timeout.*` 控制管理 API 的 header、读、写、空闲超时。
+- `tls.*` 是 gRPC mTLS 配置，控制面验证 Envoy 客户端证书 URI SAN 等于 `client_uri`。
+- `https.*` 只保护 HTTP 管理 API，不做客户端证书认证。
+- `allowed_ips` 为空时跳过 IP 白名单。
+- `api_key` 为空时跳过 API Key 校验；非空时只接受 `X-API-KEY` header。
+- `trusted_proxies` 只影响可信代理下的 `X-Forwarded-For` 解析和限流 key。
+
+## Envoy Bootstrap
+
+`envoy.yaml` 使用 Delta gRPC ADS：
+
+- `node.id`: `envoy-local`，必须和 `config.yaml` 的 `node_id` 对齐。
+- `xds_cluster`: 指向 `127.0.0.1:18001`。
+- Envoy 使用 `certs/mtls/client.crt` 和 `client.key` 作为客户端证书。
+- Envoy 校验控制面服务端证书 DNS SAN 为 `xds-server`。
+- 控制面校验 Envoy 客户端证书 URI SAN 为 `spiffe://local/envoy/envoy-local`。
+
+如果看到 `CERTIFICATE_VERIFY_FAILED: SAN matcher`，先检查 `envoy.yaml` 的 `match_typed_subject_alt_names` 是否匹配服务端证书 SAN。
+
+## 规则模型
+
 ```json
 {
-  "code": 201,
-  "success": true,
-  "message": "ok",
-  "data": {
-    "id": "xxxx",
-    "name": "web",
-    "listen_addr": "0.0.0.0",
-    "listen_port": 9981,
-    "backends": [
-      {"address": "124.236.16.69", "port": 7073, "weight": 1}
-    ],
-    "lb_policy": "ROUND_ROBIN"
-  }
+  "id": "server-generated",
+  "name": "web",
+  "protocol": "http",
+  "listen_addr": "0.0.0.0",
+  "listen_port": 9981,
+  "backends": [
+    {"address": "127.0.0.1", "port": 8080, "weight": 1}
+  ],
+  "lb_policy": "ROUND_ROBIN"
 }
 ```
 
-### 删除规则
+字段规则：
 
-```bash
-DELETE /rules/{id}
-curl -X DELETE http://localhost:18001/rules/xxxx
-```
+- `id`：服务端生成，创建时客户端传入会被忽略。
+- `name`：唯一；只允许字母、数字、`_`、`-`，首尾必须是字母或数字。更新时不允许改名。
+- `protocol`：`http` 或 `udp`，默认 `http`。
+- `listen_addr`：合法 IP 或 DNS 名称。
+- `listen_port`：`10..65535`。
+- `backends`：至少 1 个；`address` 为合法 IP 或 DNS；`port` 为 `1..65535`；`weight` 为 0 时归一化成 1。
+- `lb_policy`：`ROUND_ROBIN`、`LEAST_REQUEST`、`RANDOM`、`RING_HASH`，默认 `ROUND_ROBIN`。
 
-响应：
+同一个控制面内，`name` 不能重复，`listen_addr + listen_port + protocol` 不能重复。
+
+## HTTP API
+
+统一响应：
+
 ```json
 {
   "code": 200,
   "success": true,
   "message": "ok",
-  "data": {
-    "id": "xxxx",
-  }
+  "data": {}
 }
+```
+
+### 创建规则
+
+```bash
+curl -k -X POST https://127.0.0.1:18000/rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "web",
+    "protocol": "http",
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9981,
+    "backends": [
+      {"address": "127.0.0.1", "port": 8080, "weight": 1}
+    ],
+    "lb_policy": "ROUND_ROBIN"
+  }'
+```
+
+### UDP 规则
+
+```bash
+curl -k -X POST https://127.0.0.1:18000/rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "dns",
+    "protocol": "udp",
+    "listen_addr": "0.0.0.0",
+    "listen_port": 1053,
+    "backends": [
+      {"address": "127.0.0.1", "port": 53}
+    ]
+  }'
 ```
 
 ### 更新规则
 
 ```bash
-PUT /rules/{id}
-curl -X PUT http://localhost:18001/rules/a57f656a42a6ebb2
-Content-Type: application/json
-
-{
-  "listen_port": 9982,
-  "listen_addr":    "0.0.0.0",
-  "backends": [
-    {
-      "address":  "124.236.16.69",
-      "port": 7073,
-      "weight": 1
-    }
-  ],
-  "lb_policy": "ROUND_ROBIN"
-}
-
-```
-响应：
-```json
-{
-  "code": 200,
-  "success": true,
-  "message": "ok",
-  "data": {
-    "id": "xxxx",
-    "name": "web",
-    "listen_addr": "0.0.0.0",
+curl -k -X PUT https://127.0.0.1:18000/rules/{id} \
+  -H 'Content-Type: application/json' \
+  -d '{
     "listen_port": 9982,
     "backends": [
-      {"address": "124.236.16.69", "port": 7073, "weight": 1}
-    ],
-    "lb_policy": "ROUND_ROBIN"
-  }
-}
+      {"address": "127.0.0.1", "port": 8081}
+    ]
+  }'
 ```
 
-### 列出所有规则
+更新语义：
+
+- URL 里的 `{id}` 为准，body 里的 `id` 被忽略。
+- `name` 继承旧值，不允许通过更新修改。
+- 未传的 `protocol`、`listen_addr`、`listen_port`、`lb_policy`、`backends` 会继承旧值。
+- body 后有多余 JSON 内容会返回 400。
+
+### 查询和删除
 
 ```bash
-GET /rules
-curl http://localhost:18001/rules
+curl -k https://127.0.0.1:18000/rules
+curl -k https://127.0.0.1:18000/rules/{id}
+curl -k -X DELETE https://127.0.0.1:18000/rules/{id}
 ```
 
-
-响应：
-```json
-{
-  "code": 200,
-  "success": true,
-  "message": "ok",
-  "data": [
-    {
-      "id": "xxxx",
-      "name": "web",
-      "listen_addr": "0.0.0.0",
-      "listen_port": 9982,
-      "backends": [
-        {"address": "124.236.16.69", "port": 7073, "weight": 1}
-      ],
-      "lb_policy": "ROUND_ROBIN"
-    }
-  ]
-}
-```
-
-
-## 完整示例
+### 健康和节点
 
 ```bash
-
-# 创建代理规则
-curl -X POST http://localhost:18001/rules \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "web",
-    "listen_port": 9981,
-    "listen_addr": "0.0.0.0",
-    "backends": [
-      {
-        "address": "124.236.16.69",
-        "port": 7073,
-        "weight": 1
-      },
-      {
-        "address": "124.236.16.70",
-        "port": 7073,
-        "weight": 2
-      }
-    ],
-    "lb_policy": "RING_HASH"
-  }'
-
-# 验证规则生效
-curl http://localhost:9981/
-
-# 更新现有规则
-curl -X PUT http://localhost:18001/rules/682bcd0507c4ec23 \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "listen_port":9982,
-    "listen_addr": "0.0.0.0",
-    "backends": [
-      {
-        "address": "124.236.16.69",
-        "port": 7073,
-        "weight": 1
-      }
-    ],
-    "lb_policy":"ROUND_ROBIN"
-  }'
-
-# 验证规则生效
-curl http://localhost:9982/
-
-# 查看所有规则
-curl http://localhost:18001/rules
-
-# 删除规则
-curl -X DELETE http://localhost:18001/rules/682bcd0507c4ec23
-
-# 查看 Envoy 配置
-curl -s http://localhost:9901/config_dump | python3 -m json.tool
+curl -k https://127.0.0.1:18000/health
+curl -k https://127.0.0.1:18000/nodes
+curl -k https://127.0.0.1:18000/metrics
 ```
 
-## 验证清单
+`/health` 返回规则数、Envoy 连接状态、连续持久化失败次数、运行时间、HTTP 请求和错误计数。
 
-| # | 验证项 | 方法 | 预期 |
-|---|--------|------|------|
-| 1 | 创建规则 | `POST /rules` | 201 Created |
-| 2 | 代理生效 | `curl localhost:9000` | 返回上游响应 |
-| 3 | 多规则隔离 | 创建 2 个规则各监听不同端口 | 各自独立代理 |
-| 4 | 删除规则 | `DELETE /rules/web` | Envoy 移除该 listener |
-| 5 | 轮询策略 | 指定 `LEAST_REQUEST` | config_dump 确认 |
+`/nodes` 只返回当前持有活跃 xDS watch 的 Envoy 节点。
+
+`/metrics` 输出 JSON，包含 HTTP 请求计数、限流计数和 gRPC 请求计数。
+
+gRPC 指标里，`connections_total` 是累计建立的 stream 数，`active_connections` 是当前活跃 stream 数。
+
+## 认证和限流
+
+API Key 示例：
+
+```bash
+curl -k -H 'X-API-KEY: your-secret' https://127.0.0.1:18000/rules
+```
+
+不会接受 `?api_key=`，避免密钥进入 URL 日志。
+
+限流默认每个客户端 IP 每秒 20 次，突发 40 次。只有请求来源命中 `trusted_proxies` 时，限流和 IP 白名单才会使用 `X-Forwarded-For` 解析真实客户端 IP；否则只使用 `RemoteAddr`。
+
+## 持久化
+
+规则保存到 `store_path`，默认 `data/rules.json`。
+
+- 写入使用临时文件 + `fsync` + `rename`。
+- 保存前按 `id` 排序。
+- 启动加载时会跳过非法规则、空 ID、重复 ID。
+- CRUD 推送 xDS 成功后再持久化；持久化失败不回滚已推送配置，会在 `/health.data.persist_failures` 体现。
+
+## 日志和排障
+
+普通日志级别由 `log_level` 控制：`DEBUG`、`INFO`、`WARN`、`ERROR`。
+
+启动时应看到：
+
+```text
+xDS 控制面就绪
+  gRPC (ADS)  127.0.0.1:18001
+  HTTP (API)  127.0.0.1:18000
+```
+
+常见问题：
+
+- `CERTIFICATE_VERIFY_FAILED: SAN matcher`：Envoy 校验的服务端证书 SAN 不匹配，检查 `envoy.yaml` 的 `match_typed_subject_alt_names`。
+- `加载 TLS 凭证失败`：先运行 `./tools/generate-certs.sh`，并检查 `config.yaml` 的证书路径。
+- `来源 IP 不允许`：当前默认只允许 `127.0.0.1` 访问管理 API。
+- API 返回 429：触发 `rate_limit`。
+- Envoy 没有代理端口：先看 `/nodes` 是否有 watch，再看规则是否创建成功。
+
+## 生产注意
+
+- 生产不要把管理 API 裸露到公网。
+- `api_addr` 绑定非 loopback 时，应设置强 `api_key`，并配置网络层访问控制。
+- 只在可信反向代理地址里配置 `trusted_proxies`。
+- 使用正式 CA 或 SPIFFE/SPIRE 签发 mTLS 证书。
+- `certs/` 和 `data/rules.json` 默认不应提交。

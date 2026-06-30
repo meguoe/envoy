@@ -1,4 +1,4 @@
-package xdsServer
+package xdsserver
 
 // model.go —— 数据模型与常量
 //
@@ -9,6 +9,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"regexp"
 	"strings"
 )
 
@@ -17,7 +19,9 @@ import (
 // GenerateID 生成 16 字符的随机 hex ID
 func GenerateID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Errorf("生成规则 ID 失败: %w", err))
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -32,6 +36,10 @@ var validProtocols = map[string]bool{
 	ProtocolHTTP: true,
 	ProtocolUDP:  true,
 }
+
+var validNameChars = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$`)
+
+var validDNSName = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$`)
 
 // ─── 负载均衡策略 ──────────────────────────────────────────────────────
 
@@ -82,18 +90,24 @@ type EnvoyNodeInfo struct {
 // ValidateRule 校验规则，不修改输入参数
 // 返回 ValidationError 表示校验失败
 //
-// 注意: ListenPort 校验范围为 10-65534。
+// 注意: ListenPort 校验范围为 10-65535。
 // 对于 UpdateRule 场景，调用方应先处理 ListenPort==0 的继承逻辑再调用 ValidateRule，
 // 或在 HTTP 层对 ListenPort 做前置校验（如 handleUpdate）。
 func ValidateRule(rule *ProxyRule) error {
 	if rule.Name == "" {
 		return &ValidationError{Msg: "name 不能为空"}
 	}
+	if !validNameChars.MatchString(rule.Name) {
+		return &ValidationError{Msg: "name 仅允许字母、数字、下划线、短横线，且首尾必须为字母或数字"}
+	}
 	if rule.ListenAddr == "" {
 		return &ValidationError{Msg: "listen_addr 不能为空"}
 	}
-	if rule.ListenPort < 10 || rule.ListenPort > 65534 {
-		return &ValidationError{Msg: "listen_port 超出范围 (10-65534)"}
+	if err := validateAddress(rule.ListenAddr); err != nil {
+		return &ValidationError{Msg: fmt.Sprintf("listen_addr: %v", err)}
+	}
+	if rule.ListenPort < 10 || rule.ListenPort > 65535 {
+		return &ValidationError{Msg: "listen_port 超出范围 (10-65535)"}
 	}
 	if len(rule.Backends) == 0 {
 		return &ValidationError{Msg: "backends 不能为空，至少需要一个后端节点"}
@@ -112,6 +126,12 @@ func ValidateRule(rule *ProxyRule) error {
 	for i, b := range rule.Backends {
 		if b.Address == "" || b.Port == 0 {
 			return &ValidationError{Msg: fmt.Sprintf("backends[%d]: address 和 port 不能为空", i)}
+		}
+		if b.Port > 65535 {
+			return &ValidationError{Msg: fmt.Sprintf("backends[%d].port 超出范围 (1-65535)", i)}
+		}
+		if err := validateAddress(b.Address); err != nil {
+			return &ValidationError{Msg: fmt.Sprintf("backends[%d].address: %v", i, err)}
 		}
 	}
 
@@ -136,4 +156,21 @@ func NormalizeRule(rule *ProxyRule) {
 			rule.Backends[i].Weight = 1
 		}
 	}
+}
+
+// validateAddress 验证地址是合法 IP 或合法 DNS 名称
+func validateAddress(addr string) error {
+	if net.ParseIP(addr) != nil {
+		return nil
+	}
+	if !validDNSName.MatchString(addr) {
+		return fmt.Errorf("地址格式无效 %q: 需要合法 IP 或 DNS 名称", addr)
+	}
+	if strings.Contains(addr, "..") {
+		return fmt.Errorf("地址格式无效 %q: 不能包含连续的点", addr)
+	}
+	if strings.HasPrefix(addr, ".") || strings.HasSuffix(addr, ".") {
+		return fmt.Errorf("地址格式无效 %q: 不能以点开头或结尾", addr)
+	}
+	return nil
 }

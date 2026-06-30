@@ -1,0 +1,39 @@
+node_id: envoy-local
+
+log_level: INFO
+
+api_addr: "127.0.0.1:18000"
+grpc_addr: "127.0.0.1:18001"
+store_path: data/rules.json
+
+
+connect_timeout: 1s
+udp_idle_timeout: 60s
+max_body_bytes: 1048576
+
+rate_limit:
+  rps: 20
+  burst: 40
+
+auth:
+  api_key: ""
+  allowed_ips:
+    - 127.0.0.1
+  trusted_proxies: []
+
+http_timeout:
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 60s
+  read_header_timeout: 5s
+
+tls:
+  ca_cert: ./certs/mtls/ca.crt
+  server_cert: ./certs/mtls/server.crt
+  server_key: ./certs/mtls/server.key
+  client_uri: spiffe://local/envoy/envoy-local
+
+https:
+  enabled: true
+  key_file: ./certs/https/server.key
+  cert_file: ./certs/https/server.crt

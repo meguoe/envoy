@@ -1,4 +1,4 @@
-package xdsServer
+package xdsserver
 
 // snapshot.go —— 快照组装与推送到 Envoy
 //
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync/atomic"
 
 	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -20,6 +21,7 @@ import (
 
 // pushSnapshotLocked 构建快照并推送到 Envoy
 // 调用方必须持有 e.pushMu，保证规则修改与推送的原子性
+// 本函数不修改 e.rules，不触发持久化；构建失败的规则跳过但保留在内存中
 func (e *Engine) pushSnapshotLocked() error {
 	// 在 pushMu 保护下取快照，此时不会有其他 CRUD 操作修改 rules
 	e.mu.RLock()
@@ -30,20 +32,12 @@ func (e *Engine) pushSnapshotLocked() error {
 	e.mu.RUnlock()
 
 	// 增量同步（pushMu 串行化，resCache 无并发读写）
-	failedRules := e.syncResCache(snapshot)
-
-	// 构建失败的规则从内存中移除
+	failedRules := e.syncResCache(snapshot, e.connectTimeout, e.udpIdleTimeout)
 	if len(failedRules) > 0 {
-		e.mu.Lock()
-		for _, name := range failedRules {
-			delete(e.rules, name)
-			log.Printf("构建失败，移除规则: %s", name)
-		}
-		e.mu.Unlock()
-		e.notifyRulesChanged()
+		return fmt.Errorf("资源构建失败，跳过规则: %s", strings.Join(failedRules, ", "))
 	}
 
-	// 排序组装
+	// 排序组装（仅使用 resCache 中构建成功的规则）
 	names := make([]string, 0, len(e.resCache))
 	for name := range e.resCache {
 		names = append(names, name)

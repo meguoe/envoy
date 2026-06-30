@@ -1,4 +1,4 @@
-package xdsServer
+package xdsserver
 
 // resource.go —— xDS 资源构建
 //
@@ -22,18 +22,18 @@ import (
 )
 
 // buildOneRule 根据协议类型分发
-func buildOneRule(rule *ProxyRule) (*ruleRes, error) {
+func buildOneRule(rule *ProxyRule, connectTimeout, udpIdleTimeout time.Duration) (*ruleRes, error) {
 	switch rule.Protocol {
 	case ProtocolUDP:
-		return buildUDPRule(rule)
+		return buildUDPRule(rule, connectTimeout, udpIdleTimeout)
 	default:
-		return buildHTTPRule(rule)
+		return buildHTTPRule(rule, connectTimeout)
 	}
 }
 
 // ─── HTTP ──────────────────────────────────────────────────────────────
 
-func buildHTTPRule(rule *ProxyRule) (*ruleRes, error) {
+func buildHTTPRule(rule *ProxyRule, connectTimeout time.Duration) (*ruleRes, error) {
 	clusterName := "cluster_" + rule.Name
 	routeName := "route_" + rule.Name
 
@@ -61,7 +61,7 @@ func buildHTTPRule(rule *ProxyRule) (*ruleRes, error) {
 	// CDS
 	cl := &cluster.Cluster{
 		Name:                 clusterName,
-		ConnectTimeout:       durationpb.New(time.Second),
+		ConnectTimeout:       durationpb.New(connectTimeout),
 		ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
 		EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
 			EdsConfig: adsSource(),
@@ -135,7 +135,7 @@ func buildHTTPRule(rule *ProxyRule) (*ruleRes, error) {
 
 // ─── UDP ───────────────────────────────────────────────────────────────
 
-func buildUDPRule(rule *ProxyRule) (*ruleRes, error) {
+func buildUDPRule(rule *ProxyRule, connectTimeout, udpIdleTimeout time.Duration) (*ruleRes, error) {
 	clusterName := "cluster_" + rule.Name
 
 	lbEndpoints := make([]*endpoint.LbEndpoint, 0, len(rule.Backends))
@@ -152,7 +152,7 @@ func buildUDPRule(rule *ProxyRule) (*ruleRes, error) {
 
 	cl := &cluster.Cluster{
 		Name:                 clusterName,
-		ConnectTimeout:       durationpb.New(time.Second),
+		ConnectTimeout:       durationpb.New(connectTimeout),
 		ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_STATIC},
 		LbPolicy:             parseLBPolicy(rule.LBPolicy),
 		LoadAssignment: &endpoint.ClusterLoadAssignment{
@@ -182,7 +182,7 @@ func buildUDPRule(rule *ProxyRule) (*ruleRes, error) {
 				},
 			},
 		},
-		IdleTimeout: durationpb.New(60 * time.Second),
+		IdleTimeout: durationpb.New(udpIdleTimeout),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("序列化 UDP 代理配置失败: %w", err)

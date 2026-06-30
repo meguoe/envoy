@@ -1,4 +1,4 @@
-package xdsServer
+package xdsserver
 
 // helper.go —— 工具函数
 

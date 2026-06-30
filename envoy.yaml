@@ -3,32 +3,76 @@ node:
   id: envoy-local
   cluster: local-cluster
 
+# 动态资源配置 — 使用 Delta gRPC ADS
 dynamic_resources:
   ads_config:
     api_type: DELTA_GRPC
     transport_api_version: V3
     set_node_on_first_message_only: true
+
+    # gRPC 服务配置 — 重试策略为 1s 到 5s 之间的指数退避
     grpc_services:
       - envoy_grpc:
           cluster_name: xds_cluster
+          retry_policy:
+            retry_back_off:
+              base_interval: 1s
+              max_interval: 5s
+
   cds_config:
     resource_api_version: V3
     ads: {}
+
   lds_config:
     resource_api_version: V3
     ads: {}
 
+# 静态资源配置 — 仅配置一个集群，监听端口 18000
 static_resources:
   clusters:
     - name: xds_cluster
       connect_timeout: 1s
-      type: STRICT_DNS
+      type: STATIC
       lb_policy: ROUND_ROBIN
+
+      # 断路器配置 — 最大连接数 4，最大待处理请求数 32，最大请求数 64，最大重试数 8
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 4
+            max_pending_requests: 32
+            max_requests: 64
+            max_retries: 8
+            track_remaining: true
+
+      # HTTP 协议选项 — 启用 HTTP/2 协议
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
             http2_protocol_options: {}
+
+      # mTLS 配置 — 验证 xDS 服务器证书，并提供客户端证书
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: xds-server
+          common_tls_context:
+            tls_certificates:
+              - certificate_chain:
+                  filename: "./certs/mtls/client.crt"
+                private_key:
+                  filename: "./certs/mtls/client.key"
+            validation_context:
+              trusted_ca:
+                filename: "./certs/mtls/ca.crt"
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: xds-server
+
+      # 负载分配配置 — 仅有一个端点，监听端口 18000
       load_assignment:
         cluster_name: xds_cluster
         endpoints:
@@ -37,10 +81,20 @@ static_resources:
                   address:
                     socket_address:
                       address: 127.0.0.1
-                      port_value: 18000
+                      port_value: 18001
 
-admin:
-  address:
-    socket_address:
-      address: 127.0.0.1
-      port_value: 9901
+# 负载管理器配置 — 限制下游连接数为 256
+overload_manager:
+  refresh_interval: 0.25s
+  resource_monitors:
+    - name: envoy.resource_monitors.global_downstream_max_connections
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 256
+
+# 管理员接口配置 — 仅限开发环境使用，生产环境请注释或移除
+# admin:
+#   address:
+#     socket_address:
+#       address: 127.0.0.1
+#       port_value: 9901

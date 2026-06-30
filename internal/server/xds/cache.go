@@ -1,4 +1,4 @@
-package xdsServer
+package xdsserver
 
 // cache.go —— 增量缓存同步
 //
@@ -9,13 +9,14 @@ package xdsServer
 
 import (
 	"log"
+	"time"
 
 	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 )
 
 // syncResCache 增量同步资源缓存
 // 返回构建失败的规则名列表
-func (e *Engine) syncResCache(current map[string]*ProxyRule) []string {
+func (e *Engine) syncResCache(current map[string]*ProxyRule, connectTimeout, udpIdleTimeout time.Duration) []string {
 	// 清理已删除
 	for name := range e.resCache {
 		if _, ok := current[name]; !ok {
@@ -27,7 +28,7 @@ func (e *Engine) syncResCache(current map[string]*ProxyRule) []string {
 	for name, rule := range current {
 		cached, ok := e.resCache[name]
 		if !ok || cached.owner != rule {
-			res, err := buildOneRule(rule)
+			res, err := buildOneRule(rule, connectTimeout, udpIdleTimeout)
 			if err != nil {
 				log.Printf("构建资源失败 name=%s: %v", name, err)
 				failed = append(failed, name)
@@ -42,9 +43,19 @@ func (e *Engine) syncResCache(current map[string]*ProxyRule) []string {
 
 // collectResources 从缓存中按类型收集资源列表
 func (e *Engine) collectResources(names []string) (eps, cls, rts, lis []types.Resource) {
-	eps = make([]types.Resource, 0, len(names))
+	var epCount, rtCount int
+	for _, name := range names {
+		cr := e.resCache[name]
+		if cr.endpoint != nil {
+			epCount++
+		}
+		if cr.route != nil {
+			rtCount++
+		}
+	}
+	eps = make([]types.Resource, 0, epCount)
 	cls = make([]types.Resource, 0, len(names))
-	rts = make([]types.Resource, 0, len(names))
+	rts = make([]types.Resource, 0, rtCount)
 	lis = make([]types.Resource, 0, len(names))
 	for _, name := range names {
 		cr := e.resCache[name]

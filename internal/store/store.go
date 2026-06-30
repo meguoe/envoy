@@ -1,4 +1,4 @@
-package main
+package store
 
 // store.go —— 数据持久化
 
@@ -10,21 +10,14 @@ import (
 	"path/filepath"
 	"sort"
 
-	xdsServer "envoy-control-plane/xds_server"
+	xdsserver "envoy-control-plane/internal/server/xds"
 )
 
-var storePath = func() string {
-	if p := os.Getenv("XDS_STORE_PATH"); p != "" {
-		return p
-	}
-	return "data/rules.json"
-}()
-
-func loadRules() ([]*xdsServer.ProxyRule, error) {
-	data, err := os.ReadFile(storePath)
+func Load(path string) ([]*xdsserver.ProxyRule, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("数据文件不存在，从空状态启动  path=%s", storePath)
+			log.Printf("数据文件不存在，从空状态启动  path=%s", path)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("读取数据文件失败: %w", err)
@@ -33,41 +26,54 @@ func loadRules() ([]*xdsServer.ProxyRule, error) {
 		return nil, nil
 	}
 
-	var list []xdsServer.ProxyRule
+	var list []xdsserver.ProxyRule
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, fmt.Errorf("解析数据文件失败: %w", err)
 	}
 
-	rules := make([]*xdsServer.ProxyRule, 0, len(list))
+	rules := make([]*xdsserver.ProxyRule, 0, len(list))
+	seenIDs := make(map[string]struct{}, len(list))
 	for i := range list {
-		if err := xdsServer.ValidateRule(&list[i]); err != nil {
+		if list[i].ID == "" {
+			log.Printf("跳过非法规则 #%d: id 不能为空", i)
+			continue
+		}
+		if _, ok := seenIDs[list[i].ID]; ok {
+			log.Printf("跳过非法规则 #%d: id %q 重复", i, list[i].ID)
+			continue
+		}
+		if err := xdsserver.ValidateRule(&list[i]); err != nil {
 			log.Printf("跳过非法规则 #%d: %v", i, err)
 			continue
 		}
-		xdsServer.NormalizeRule(&list[i])
+		xdsserver.NormalizeRule(&list[i])
+		seenIDs[list[i].ID] = struct{}{}
 		rules = append(rules, &list[i])
 	}
 
-	// 与 saveRules 保持一致：按 ID 排序
+	// 与 Save 保持一致：按 ID 排序
 	sort.Slice(rules, func(i, j int) bool {
 		return rules[i].ID < rules[j].ID
 	})
 
-	log.Printf("已从文件加载 %d 条规则  path=%s", len(rules), storePath)
+	log.Printf("已从文件加载 %d 条规则  path=%s", len(rules), path)
 	return rules, nil
 }
 
-func saveRules(list []*xdsServer.ProxyRule) error {
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].ID < list[j].ID
+func Save(path string, list []*xdsserver.ProxyRule) error {
+	sorted := make([]*xdsserver.ProxyRule, len(list))
+	copy(sorted, list)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ID < sorted[j].ID
 	})
+	list = sorted
 
 	data, err := json.Marshal(list)
 	if err != nil {
 		return fmt.Errorf("序列化失败: %w", err)
 	}
 
-	if err := atomicWrite(storePath, data); err != nil {
+	if err := atomicWrite(path, data); err != nil {
 		return fmt.Errorf("写入失败: %w", err)
 	}
 	return nil
