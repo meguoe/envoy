@@ -36,8 +36,17 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.APIAddr != "127.0.0.1:18000" {
 		t.Errorf("default api_addr = %q, want 127.0.0.1:18000", cfg.APIAddr)
 	}
-	if cfg.StorePath != "data/rules.json" {
-		t.Errorf("default store_path = %q, want data/rules.json", cfg.StorePath)
+	if cfg.Database.Host != "localhost" {
+		t.Errorf("default database.host = %q, want localhost", cfg.Database.Host)
+	}
+	if cfg.Database.Port != "7032" {
+		t.Errorf("default database.port = %q, want 7032", cfg.Database.Port)
+	}
+	if cfg.Database.User != "hiddos" {
+		t.Errorf("default database.user = %q, want hiddos", cfg.Database.User)
+	}
+	if cfg.Database.DBName != "hiddos-ecp" {
+		t.Errorf("default database.dbname = %q, want hiddos-ecp", cfg.Database.DBName)
 	}
 	if cfg.LogLevel != "INFO" {
 		t.Errorf("default log_level = %q, want INFO", cfg.LogLevel)
@@ -104,11 +113,43 @@ func TestValidateBadAPIAddr(t *testing.T) {
 	}
 }
 
-func TestValidateEmptyStorePath(t *testing.T) {
+func TestValidateEmptyDatabaseHost(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.StorePath = ""
+	cfg.Database.Host = ""
 	if err := cfg.validate(); err == nil {
-		t.Error("expected error for empty store_path")
+		t.Error("expected error for empty database.host")
+	}
+}
+
+func TestValidateEmptyDatabasePort(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Database.Port = ""
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for empty database.port")
+	}
+}
+
+func TestValidateInvalidDatabasePort(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Database.Port = "abc"
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for invalid database.port")
+	}
+}
+
+func TestValidateEmptyDatabaseUser(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Database.User = ""
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for empty database.user")
+	}
+}
+
+func TestValidateEmptyDatabaseDBName(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Database.DBName = ""
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for empty database.dbname")
 	}
 }
 

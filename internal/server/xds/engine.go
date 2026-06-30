@@ -55,20 +55,21 @@ var ErrRuleNotFound = errors.New("rule not found")
 
 // Engine xDS 引擎，封装所有 xDS 状态
 type Engine struct {
-	nodeID          string
-	snapCache       cache.SnapshotCache
-	rules           map[string]*ProxyRule
-	resCache        map[string]*ruleRes // 注意: 仅在 pushMu 保护下读写, 不可并发访问
-	versionSeq      uint64
-	persistFailures atomic.Uint64 // 持久化连续失败计数
-	mu              sync.RWMutex  // 保护 rules
-	pushMu          sync.Mutex    // 串行化「修改 + 推送」
-	persistMu       sync.Mutex    // 串行化持久化写入，避免旧快照后写覆盖新快照
-	onRulesChanged  func([]*ProxyRule) error
-	connectTimeout  time.Duration
-	udpIdleTimeout  time.Duration
-	ctx             context.Context
-	cancel          context.CancelFunc
+	nodeID         string
+	snapCache      cache.SnapshotCache
+	rules          map[string]*ProxyRule
+	resCache       map[string]*ruleRes // 注意: 仅在 pushMu 保护下读写, 不可并发访问
+	versionSeq     uint64
+	mu             sync.RWMutex // 保护 rules
+	pushMu         sync.Mutex   // 串行化「修改 + 推送」
+	connectTimeout time.Duration
+	udpIdleTimeout time.Duration
+	ctx            context.Context
+	cancel         context.CancelFunc
+	callbacks      server.Callbacks
+
+	knownRevision    atomic.Int64 // Engine 已知的 DB revision
+	deployedRevision atomic.Int64 // Envoy 已 ACK 的 revision
 
 	// 冲突检测索引（在 pushMu + mu 保护下维护）
 	nameIndex map[string]string // ruleName → ruleID
@@ -103,40 +104,10 @@ func (e *Engine) Close() {
 	e.cancel()
 }
 
-// SetOnRulesChanged 设置规则变更后的持久化回调（同步调用）
-// 每次 CRUD 成功并推送快照后自动调用，返回 error 表示持久化失败
-// 注意：必须在任何 CRUD 操作之前调用（启动时），不保证并发安全
-func (e *Engine) SetOnRulesChanged(fn func([]*ProxyRule) error) {
-	e.onRulesChanged = fn
-}
-
-// notifyRulesChanged 同步执行持久化回调
-// 在 pushMu 保护下、快照推送成功后调用
-// 持久化失败不回滚（Envoy 已收到新配置），但记录失败计数并告警
-func (e *Engine) notifyRulesChanged() {
-	e.notifyRulesChangedWith(e.ListRules())
-}
-
-func (e *Engine) notifyRulesChangedWith(rules []*ProxyRule) {
-	if e.onRulesChanged == nil {
-		return
-	}
-	if err := e.onRulesChanged(rules); err != nil {
-		n := e.persistFailures.Add(1)
-		log.Printf("持久化失败 (累计 %d 次): %v", n, err)
-		if n >= 3 {
-			log.Printf("警告: 持久化已连续失败 %d 次，内存规则与文件可能不一致", n)
-		}
-	} else {
-		e.persistFailures.Store(0)
-	}
-}
-
-func (e *Engine) persistRulesAfterPush(rules []*ProxyRule) {
-	e.persistMu.Lock()
-	e.pushMu.Unlock()
-	e.notifyRulesChangedWith(rules)
-	e.persistMu.Unlock()
+// SetCallbacks 设置 xDS 回调（ACK/NACK 追踪）
+// 必须在 NewGRPCServer 之前调用
+func (e *Engine) SetCallbacks(cb server.Callbacks) {
+	e.callbacks = cb
 }
 
 // ─── gRPC 服务器 ───────────────────────────────────────────────────────
@@ -148,7 +119,7 @@ func (e *Engine) NewGRPCServer(opts ...grpc.ServerOption) *grpc.Server {
 		grpc.UnaryInterceptor(UnaryServerInterceptor()),
 		grpc.StreamInterceptor(StreamServerInterceptor()),
 	)
-	srv := server.NewServer(e.ctx, e.snapCache, nil)
+	srv := server.NewServer(e.ctx, e.snapCache, e.callbacks)
 	gs := grpc.NewServer(opts...)
 	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(gs, srv)
 	clusterservice.RegisterClusterDiscoveryServiceServer(gs, srv)
@@ -164,7 +135,6 @@ func (e *Engine) StartGRPC(addr string, gs *grpc.Server) error {
 	if err != nil {
 		return fmt.Errorf("监听 gRPC 失败: %w", err)
 	}
-	log.Printf("xDS gRPC 启动 %s", addr)
 	return gs.Serve(lis)
 }
 
@@ -210,12 +180,59 @@ func (e *Engine) removeIndexes(rule *ProxyRule) {
 	delete(e.portIndex, key)
 }
 
-// SetRules 批量加载规则（用于启动时从文件加载，不触发推送）
+// CheckRulesConflicts 检查规则列表内部的冲突（ID重复、名称冲突、端口冲突）
+// 不修改引擎状态，仅做验证
+func CheckRulesConflicts(list []*ProxyRule) error {
+	nameIndex := make(map[string]string, len(list))
+	portIndex := make(map[string]string, len(list))
+	seenIDs := make(map[string]struct{}, len(list))
+
+	for _, r := range list {
+		if err := ValidateRule(r); err != nil {
+			return err
+		}
+		NormalizeRule(r)
+		if r.ID == "" {
+			return &ValidationError{Msg: fmt.Sprintf("规则 ID 为空: %s", r.Name)}
+		}
+		if _, ok := seenIDs[r.ID]; ok {
+			return &ValidationError{Msg: fmt.Sprintf("规则 ID 重复: %s", r.ID)}
+		}
+		if existingID, ok := nameIndex[r.Name]; ok {
+			return &ValidationError{Msg: fmt.Sprintf("规则名 %q 已被规则 %s 占用", r.Name, existingID)}
+		}
+		key := r.ListenAddr + ":" + fmt.Sprintf("%d", r.ListenPort) + ":" + r.Protocol
+		if existingID, ok := portIndex[key]; ok {
+			return &ValidationError{Msg: fmt.Sprintf("%s://%s:%d 已被规则 %s 占用", r.Protocol, r.ListenAddr, r.ListenPort, existingID)}
+		}
+		nameIndex[r.Name] = r.ID
+		portIndex[key] = r.ID
+		seenIDs[r.ID] = struct{}{}
+	}
+	return nil
+}
+
+// SetRules 批量加载规则（用于启动时从数据库加载，不触发推送）
 func (e *Engine) SetRules(list []*ProxyRule) {
+	e.pushMu.Lock()
+	defer e.pushMu.Unlock()
+	e.setRulesNoPush(list)
+}
+
+func (e *Engine) setRulesNoPush(list []*ProxyRule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.rules = make(map[string]*ProxyRule, len(list))
+	e.resCache = make(map[string]*ruleRes)
+	e.nameIndex = make(map[string]string, len(list))
+	e.portIndex = make(map[string]string, len(list))
 	seenIDs := make(map[string]struct{}, len(list))
 	for _, r := range list {
+		if err := ValidateRule(r); err != nil {
+			log.Printf("跳过非法规则 %s: %v", r.ID, err)
+			continue
+		}
+		NormalizeRule(r)
 		if r.ID == "" {
 			log.Printf("跳过 ID 为空的规则: %s", r.Name)
 			continue
@@ -242,123 +259,32 @@ func (e *Engine) SetRules(list []*ProxyRule) {
 	}
 }
 
-// CreateRule 创建规则并推送到 Envoy
-// 流程：校验 → 生成ID → 加锁 → 端口冲突检测 → 写入内存 → 推送快照 → 失败则回滚
-func (e *Engine) CreateRule(rule *ProxyRule) (*ProxyRule, error) {
-	if err := ValidateRule(rule); err != nil {
-		return nil, err
-	}
-	NormalizeRule(rule)
-	rule.ID = GenerateID()
-
+// ReplaceRulesAndPush 从数据库重新加载规则并推送快照，不触发持久化回写。
+func (e *Engine) ReplaceRulesAndPush(list []*ProxyRule) error {
 	e.pushMu.Lock()
-
-	e.mu.Lock()
-	if err := e.checkNameConflict(rule); err != nil {
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, err
-	}
-	if err := e.checkPortConflict(rule); err != nil {
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, err
-	}
-	e.rules[rule.ID] = rule
-	e.addIndexes(rule)
-	e.mu.Unlock()
-
+	oldRules := e.ListRules()
+	e.setRulesNoPush(list)
 	if err := e.pushSnapshotLocked(); err != nil {
-		e.mu.Lock()
-		delete(e.rules, rule.ID)
-		e.removeIndexes(rule)
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, fmt.Errorf("推送快照失败: %w", err)
-	}
-
-	e.persistRulesAfterPush(e.ListRules())
-	log.Printf("创建规则: %s (%s)  %s:%d -> %d 后端 [%s]",
-		rule.ID, rule.Name, rule.ListenAddr, rule.ListenPort, len(rule.Backends), rule.LBPolicy)
-	return rule, nil
-}
-
-// UpdateRule 更新规则并推送到 Envoy
-func (e *Engine) UpdateRule(id string, rule *ProxyRule) (*ProxyRule, error) {
-	if err := ValidateRule(rule); err != nil {
-		return nil, err
-	}
-	NormalizeRule(rule)
-
-	e.pushMu.Lock()
-
-	e.mu.Lock()
-	oldRule, existed := e.rules[id]
-	if !existed {
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, ErrRuleNotFound
-	}
-	rule.ID = id
-	if err := e.checkNameConflict(rule); err != nil {
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, err
-	}
-	if err := e.checkPortConflict(rule); err != nil {
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, err
-	}
-	e.rules[id] = rule
-	e.removeIndexes(oldRule)
-	e.addIndexes(rule)
-	e.mu.Unlock()
-
-	if err := e.pushSnapshotLocked(); err != nil {
-		e.mu.Lock()
-		if _, stillThere := e.rules[id]; stillThere {
-			e.rules[id] = oldRule
-			e.removeIndexes(rule)
-			e.addIndexes(oldRule)
-		}
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return nil, fmt.Errorf("推送快照失败: %w", err)
-	}
-
-	e.persistRulesAfterPush(e.ListRules())
-	log.Printf("更新规则: %s (%s)  %s:%d -> %d 后端 [%s]",
-		rule.ID, rule.Name, rule.ListenAddr, rule.ListenPort, len(rule.Backends), rule.LBPolicy)
-	return rule, nil
-}
-
-// DeleteRule 删除规则并推送到 Envoy
-func (e *Engine) DeleteRule(id string) error {
-	e.pushMu.Lock()
-
-	e.mu.Lock()
-	oldRule, existed := e.rules[id]
-	if !existed {
-		e.mu.Unlock()
-		e.pushMu.Unlock()
-		return ErrRuleNotFound
-	}
-	delete(e.rules, id)
-	e.removeIndexes(oldRule)
-	e.mu.Unlock()
-
-	if err := e.pushSnapshotLocked(); err != nil {
-		e.mu.Lock()
-		e.rules[id] = oldRule
-		e.addIndexes(oldRule)
-		e.mu.Unlock()
+		e.setRulesNoPush(oldRules)
 		e.pushMu.Unlock()
 		return fmt.Errorf("推送快照失败: %w", err)
 	}
+	e.pushMu.Unlock()
+	return nil
+}
 
-	e.persistRulesAfterPush(e.ListRules())
-	log.Printf("删除规则: %s", id)
+// ReplaceRulesAndPushWithVersion 从数据库重新加载规则并推送快照，使用指定 revision 作为版本号。
+func (e *Engine) ReplaceRulesAndPushWithVersion(list []*ProxyRule, revision int64) error {
+	e.pushMu.Lock()
+	oldRules := e.ListRules()
+	e.setRulesNoPush(list)
+	if err := e.pushSnapshotLockedWithVersion(fmt.Sprintf("%d", revision)); err != nil {
+		e.setRulesNoPush(oldRules)
+		e.pushMu.Unlock()
+		return fmt.Errorf("推送快照失败: %w", err)
+	}
+	e.knownRevision.Store(revision)
+	e.pushMu.Unlock()
 	return nil
 }
 
@@ -411,9 +337,19 @@ func (e *Engine) IsEnvoyConnected() bool {
 	return info != nil && info.GetNumWatches() > 0
 }
 
-// PersistFailures 返回持久化连续失败次数
-func (e *Engine) PersistFailures() uint64 {
-	return e.persistFailures.Load()
+// KnownRevision 返回 Engine 已知的 DB revision
+func (e *Engine) KnownRevision() int64 {
+	return e.knownRevision.Load()
+}
+
+// LastDeployedRevision 返回 Envoy 已 ACK 的 revision
+func (e *Engine) LastDeployedRevision() int64 {
+	return e.deployedRevision.Load()
+}
+
+// SetDeployedRevision 设置已部署的 revision
+func (e *Engine) SetDeployedRevision(rev int64) {
+	e.deployedRevision.Store(rev)
 }
 
 // GetEnvoyNodes 返回所有已连接的 Envoy 节点信息

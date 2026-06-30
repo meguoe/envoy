@@ -10,17 +10,17 @@ Envoy API 文档：https://www.envoyproxy.io/docs/envoy/v1.38.3/api-v3/api
 - 支持 UDP 代理规则：LDS + STATIC CDS。
 - Envoy 到控制面使用 gRPC mTLS。
 - HTTP 管理 API 支持 HTTPS、IP 白名单、`X-API-KEY`、速率限制、请求体大小限制。
-- 规则持久化到 JSON 文件，启动时加载，非法规则会跳过。
+- 规则持久化到 PostgreSQL 数据库。
 - 暴露 `/health`、`/nodes`、`/metrics`。
 
-不支持：域名路由、多路由匹配、TLS 下游终止、Web UI、数据库存储。
+不支持：域名路由、多路由匹配、TLS 下游终止、Web UI。
 
 ## 目录结构
 
 ```text
 cmd/control-plane/main.go       # 启动、配置加载、服务器生命周期
 internal/config/                # config.yaml 加载和校验
-internal/store/                 # JSON 持久化
+internal/store/                 # PostgreSQL 持久化
 internal/server/http/           # 管理 API、认证、限流、日志、metrics
 internal/server/xds/            # 规则模型、xDS 引擎、资源构建、mTLS
 config.yaml                     # 控制面配置
@@ -31,8 +31,13 @@ tools/generate-certs.sh         # 本地测试证书生成
 ## 快速开始
 
 ```bash
+# 1. 生成证书
 ./tools/generate-certs.sh
+
+# 2. 启动控制面（数据库需预先存在，表会自动创建）
 go run ./cmd/control-plane
+
+# 3. 启动 Envoy
 envoy -c envoy.yaml --log-level info
 ```
 
@@ -79,7 +84,7 @@ go run ./cmd/control-plane -json-log
 
 - `api_addr` 是管理 API 地址。
 - `grpc_addr` 是 Envoy xDS ADS 地址。
-- `store_path` 是规则持久化文件。
+- `database.*` 配置 PostgreSQL 数据库连接。
 - `log_level` 控制普通日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`。
 - `max_body_bytes` 限制管理 API 请求体大小。
 - `connect_timeout` 用于生成 Envoy cluster 的连接超时。
@@ -236,12 +241,17 @@ curl -k -H 'X-API-KEY: your-secret' https://127.0.0.1:18000/rules
 
 ## 持久化
 
-规则保存到 `store_path`，默认 `data/rules.json`。
+规则持久化到 PostgreSQL 数据库。
 
-- 写入使用临时文件 + `fsync` + `rename`。
+在 `config.yaml` 中配置 `database.*`。数据库需要预先存在，首次启动会自动创建表。
+
+### 存储细节
+
+- 数据库是唯一的规则来源。HTTP API 和人工直接修改 DB 都会生效，控制面每 5 秒轮询检测变化。
+- 使用事务确保原子性：先删除再批量插入。
 - 保存前按 `id` 排序。
-- 启动加载时会跳过非法规则、空 ID、重复 ID。
 - CRUD 推送 xDS 成功后再持久化；持久化失败不回滚已推送配置，会在 `/health.data.persist_failures` 体现。
+- 控制面每 5 秒检查一次数据库规则 revision；发现变化后重新加载规则、生成快照并推送给 Envoy。
 
 ## 日志和排障
 
@@ -250,9 +260,7 @@ curl -k -H 'X-API-KEY: your-secret' https://127.0.0.1:18000/rules
 启动时应看到：
 
 ```text
-xDS 控制面就绪
-  gRPC (ADS)  127.0.0.1:18001
-  HTTP (API)  127.0.0.1:18000
+xDS 控制面就绪  gRPC=127.0.0.1:18001  HTTP=127.0.0.1:18000
 ```
 
 常见问题：
@@ -269,4 +277,4 @@ xDS 控制面就绪
 - `api_addr` 绑定非 loopback 时，应设置强 `api_key`，并配置网络层访问控制。
 - 只在可信反向代理地址里配置 `trusted_proxies`。
 - 使用正式 CA 或 SPIFFE/SPIRE 签发 mTLS 证书。
-- `certs/` 和 `data/rules.json` 默认不应提交。
+- `certs/` 默认不应提交。

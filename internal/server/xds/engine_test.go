@@ -1,11 +1,8 @@
 package xdsserver
 
 import (
-	"errors"
 	"io"
 	"log"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,106 +16,116 @@ func silenceLogs(t *testing.T) {
 	})
 }
 
-func TestPersistFailuresAtomicity(t *testing.T) {
-	silenceLogs(t)
-	e := NewEngine("test", time.Second, 60*time.Second)
-	var failCount atomic.Int32
-	e.SetOnRulesChanged(func([]*ProxyRule) error {
-		failCount.Add(1)
-		return errors.New("simulated persist failure")
-	})
-
-	const goroutines = 50
-	const iterations = 100
-
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				e.notifyRulesChanged()
-			}
-		}()
+func TestCheckRulesConflictsNoConflict(t *testing.T) {
+	rules := []*ProxyRule{
+		{ID: "a", Name: "a", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9981, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8080}}, LBPolicy: "ROUND_ROBIN"},
+		{ID: "b", Name: "b", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9982, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8081}}, LBPolicy: "ROUND_ROBIN"},
 	}
-	wg.Wait()
-
-	got := e.persistFailures.Load()
-	want := uint64(goroutines * iterations)
-	if got != want {
-		t.Errorf("persistFailures = %d, want %d", got, want)
+	if err := CheckRulesConflicts(rules); err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
-func TestPersistFailuresResetOnSuccess(t *testing.T) {
-	silenceLogs(t)
-	e := NewEngine("test", time.Second, 60*time.Second)
-	var callCount atomic.Int32
-
-	e.SetOnRulesChanged(func([]*ProxyRule) error {
-		n := callCount.Add(1)
-		// Fail 3 times, then succeed
-		if n <= 3 {
-			return errors.New("fail")
-		}
-		return nil
-	})
-
-	// First 3 calls fail
-	for i := 0; i < 3; i++ {
-		e.notifyRulesChanged()
+func TestCheckRulesConflictsDuplicateID(t *testing.T) {
+	rules := []*ProxyRule{
+		{ID: "a", Name: "a", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9981, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8080}}, LBPolicy: "ROUND_ROBIN"},
+		{ID: "a", Name: "b", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9982, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8081}}, LBPolicy: "ROUND_ROBIN"},
 	}
-	if got := e.persistFailures.Load(); got != 3 {
-		t.Errorf("after 3 failures: persistFailures = %d, want 3", got)
-	}
-
-	// 4th call succeeds, should reset to 0
-	e.notifyRulesChanged()
-	if got := e.persistFailures.Load(); got != 0 {
-		t.Errorf("after success: persistFailures = %d, want 0", got)
+	if err := CheckRulesConflicts(rules); err == nil {
+		t.Error("expected error for duplicate ID")
 	}
 }
 
-func TestPersistFailuresConcurrentReadWrite(t *testing.T) {
-	silenceLogs(t)
-	e := NewEngine("test", time.Second, 60*time.Second)
-	e.SetOnRulesChanged(func([]*ProxyRule) error {
-		return errors.New("fail")
-	})
-
-	const goroutines = 100
-	var wg sync.WaitGroup
-	wg.Add(goroutines * 2)
-
-	// Writers
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			e.notifyRulesChanged()
-		}()
+func TestCheckRulesConflictsDuplicateName(t *testing.T) {
+	rules := []*ProxyRule{
+		{ID: "a", Name: "same", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9981, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8080}}, LBPolicy: "ROUND_ROBIN"},
+		{ID: "b", Name: "same", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9982, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8081}}, LBPolicy: "ROUND_ROBIN"},
 	}
-
-	// Readers (simulating /health endpoint)
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				_ = e.PersistFailures()
-			}
-		}()
+	if err := CheckRulesConflicts(rules); err == nil {
+		t.Error("expected error for duplicate name")
 	}
-
-	wg.Wait()
-
-	// If we get here without race detector triggering, the test passes
-	t.Logf("persistFailures = %d (expected %d)", e.persistFailures.Load(), goroutines)
 }
 
-func TestPersistFailuresNoCallback(t *testing.T) {
+func TestCheckRulesConflictsPortConflict(t *testing.T) {
+	rules := []*ProxyRule{
+		{ID: "a", Name: "a", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9981, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8080}}, LBPolicy: "ROUND_ROBIN"},
+		{ID: "b", Name: "b", Protocol: "http", ListenAddr: "0.0.0.0", ListenPort: 9981, Backends: []BackendNode{{Address: "127.0.0.1", Port: 8081}}, LBPolicy: "ROUND_ROBIN"},
+	}
+	if err := CheckRulesConflicts(rules); err == nil {
+		t.Error("expected error for port conflict")
+	}
+}
+
+func TestCheckRulesConflictsEmptyList(t *testing.T) {
+	if err := CheckRulesConflicts(nil); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReplaceRulesAndPushReplacesCurrentRules(t *testing.T) {
+	silenceLogs(t)
 	e := NewEngine("test", time.Second, 60*time.Second)
-	// No callback set
-	e.notifyRulesChanged()
-	if got := e.persistFailures.Load(); got != 0 {
-		t.Errorf("no callback: persistFailures = %d, want 0", got)
+
+	e.SetRules([]*ProxyRule{{
+		ID:         "old",
+		Name:       "old",
+		Protocol:   "http",
+		ListenAddr: "0.0.0.0",
+		ListenPort: 9981,
+		Backends:   []BackendNode{{Address: "127.0.0.1", Port: 8080}},
+		LBPolicy:   "ROUND_ROBIN",
+	}})
+
+	if err := e.ReplaceRulesAndPush([]*ProxyRule{{
+		ID:         "new",
+		Name:       "new",
+		Protocol:   "http",
+		ListenAddr: "0.0.0.0",
+		ListenPort: 9982,
+		Backends:   []BackendNode{{Address: "127.0.0.1", Port: 8081}},
+		LBPolicy:   "ROUND_ROBIN",
+	}}); err != nil {
+		t.Fatalf("ReplaceRulesAndPush: %v", err)
+	}
+
+	rules := e.ListRules()
+	if len(rules) != 1 || rules[0].ID != "new" {
+		t.Fatalf("rules = %+v, want only new rule", rules)
+	}
+}
+
+func TestReplaceRulesAndPushWithVersionSetsRevision(t *testing.T) {
+	silenceLogs(t)
+	e := NewEngine("test", time.Second, 60*time.Second)
+
+	if err := e.ReplaceRulesAndPushWithVersion([]*ProxyRule{{
+		ID:         "r1",
+		Name:       "r1",
+		Protocol:   "http",
+		ListenAddr: "0.0.0.0",
+		ListenPort: 9981,
+		Backends:   []BackendNode{{Address: "127.0.0.1", Port: 8080}},
+		LBPolicy:   "ROUND_ROBIN",
+	}}, 42); err != nil {
+		t.Fatalf("ReplaceRulesAndPushWithVersion: %v", err)
+	}
+
+	if got := e.KnownRevision(); got != 42 {
+		t.Errorf("KnownRevision = %d, want 42", got)
+	}
+}
+
+func TestKnownRevisionDefaultZero(t *testing.T) {
+	e := NewEngine("test", time.Second, 60*time.Second)
+	if got := e.KnownRevision(); got != 0 {
+		t.Errorf("KnownRevision = %d, want 0", got)
+	}
+}
+
+func TestSetDeployedRevision(t *testing.T) {
+	e := NewEngine("test", time.Second, 60*time.Second)
+	e.SetDeployedRevision(5)
+	if got := e.LastDeployedRevision(); got != 5 {
+		t.Errorf("LastDeployedRevision = %d, want 5", got)
 	}
 }

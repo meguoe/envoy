@@ -4,8 +4,13 @@ log_level: INFO
 
 api_addr: "127.0.0.1:18000"
 grpc_addr: "127.0.0.1:18001"
-store_path: data/rules.json
 
+database:
+  host: localhost
+  port: "7032"
+  user: hiddos
+  password: "mxb123=-"
+  dbname: hiddos-ecp
 
 connect_timeout: 1s
 udp_idle_timeout: 60s

@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,10 +13,36 @@ import (
 	xdsserver "envoy-control-plane/internal/server/xds"
 )
 
+type mockStore struct {
+	rules    []*xdsserver.ProxyRule
+	revision int64
+}
+
+func (m *mockStore) MutateRulesAndBumpRevision(_ context.Context, mutate func([]*xdsserver.ProxyRule) ([]*xdsserver.ProxyRule, error)) ([]*xdsserver.ProxyRule, int64, error) {
+	rules, err := mutate(m.rules)
+	if err != nil {
+		return nil, 0, err
+	}
+	m.rules = rules
+	m.revision++
+	return m.rules, m.revision, nil
+}
+
+func (m *mockStore) Load(_ context.Context) ([]*xdsserver.ProxyRule, error) {
+	return m.rules, nil
+}
+
 func newTestHandler(t *testing.T) (*xdsserver.Engine, http.Handler) {
 	t.Helper()
+	engine, _, handler := newTestHandlerWithStore(t)
+	return engine, handler
+}
+
+func newTestHandlerWithStore(t *testing.T) (*xdsserver.Engine, *mockStore, http.Handler) {
+	t.Helper()
 	engine := xdsserver.NewEngine("test-node", time.Second, 60*time.Second)
-	return engine, NewHandler(engine, 1<<20, nil, 0, 0)
+	store := &mockStore{}
+	return engine, store, NewHandler(engine, store, 1<<20, nil, 0, 0)
 }
 
 func TestCreateRule201(t *testing.T) {
@@ -38,6 +65,39 @@ func TestCreateRule201(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if !resp.Success {
 		t.Errorf("POST /rules success=false, message=%s", resp.Message)
+	}
+}
+
+func TestCreateRulePreservesStoreRulesWhenEngineCacheIsStale(t *testing.T) {
+	engine, store, handler := newTestHandlerWithStore(t)
+	store.rules = []*xdsserver.ProxyRule{{
+		ID: "external", Name: "external", Protocol: "http", ListenAddr: "0.0.0.0",
+		ListenPort: 9980, Backends: []xdsserver.BackendNode{{Address: "127.0.0.1", Port: 8080, Weight: 1}},
+		LBPolicy: "ROUND_ROBIN",
+	}}
+
+	body, _ := json.Marshal(map[string]any{
+		"name":        "created",
+		"listen_port": 9981,
+		"listen_addr": "0.0.0.0",
+		"backends":    []map[string]any{{"address": "127.0.0.1", "port": 8081, "weight": 1}},
+		"lb_policy":   "ROUND_ROBIN",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/rules", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != 201 {
+		t.Fatalf("POST /rules status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if len(store.rules) != 2 {
+		t.Fatalf("store rules = %d, want 2", len(store.rules))
+	}
+	if store.rules[0].ID != "external" && store.rules[1].ID != "external" {
+		t.Fatalf("external rule was overwritten: %+v", store.rules)
+	}
+	if got := len(engine.ListRules()); got != 0 {
+		t.Fatalf("engine rules = %d, want 0 before poller push", got)
 	}
 }
 
@@ -65,17 +125,13 @@ func TestCreateRule400InvalidJSON(t *testing.T) {
 }
 
 func TestGetRule200(t *testing.T) {
-	engine, handler := newTestHandler(t)
-	rule := &xdsserver.ProxyRule{
-		Name: "test", Protocol: "http", ListenAddr: "0.0.0.0",
+	_, store, handler := newTestHandlerWithStore(t)
+	store.rules = []*xdsserver.ProxyRule{{
+		ID: "r1", Name: "test", Protocol: "http", ListenAddr: "0.0.0.0",
 		ListenPort: 9981, Backends: []xdsserver.BackendNode{{Address: "127.0.0.1", Port: 8080, Weight: 1}},
 		LBPolicy: "ROUND_ROBIN",
-	}
-	created, err := engine.CreateRule(rule)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodGet, "/rules/"+created.ID, nil)
+	}}
+	req := httptest.NewRequest(http.MethodGet, "/rules/r1", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -94,21 +150,18 @@ func TestGetRule404(t *testing.T) {
 }
 
 func TestUpdateRule200(t *testing.T) {
-	engine, handler := newTestHandler(t)
-	rule := &xdsserver.ProxyRule{
-		Name: "test", Protocol: "http", ListenAddr: "0.0.0.0",
+	_, store, handler := newTestHandlerWithStore(t)
+	rules := []*xdsserver.ProxyRule{{
+		ID: "r1", Name: "test", Protocol: "http", ListenAddr: "0.0.0.0",
 		ListenPort: 9981, Backends: []xdsserver.BackendNode{{Address: "127.0.0.1", Port: 8080, Weight: 1}},
 		LBPolicy: "ROUND_ROBIN",
-	}
-	created, err := engine.CreateRule(rule)
-	if err != nil {
-		t.Fatal(err)
-	}
+	}}
+	store.rules = rules
 	body, _ := json.Marshal(map[string]any{
 		"listen_port": 9982,
 		"backends":    []map[string]any{{"address": "127.0.0.1", "port": 9090, "weight": 1}},
 	})
-	req := httptest.NewRequest(http.MethodPut, "/rules/"+created.ID, bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/rules/r1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -130,17 +183,14 @@ func TestUpdateRule404(t *testing.T) {
 }
 
 func TestDeleteRule200(t *testing.T) {
-	engine, handler := newTestHandler(t)
-	rule := &xdsserver.ProxyRule{
-		Name: "test", Protocol: "http", ListenAddr: "0.0.0.0",
+	_, store, handler := newTestHandlerWithStore(t)
+	rules := []*xdsserver.ProxyRule{{
+		ID: "r1", Name: "test", Protocol: "http", ListenAddr: "0.0.0.0",
 		ListenPort: 9981, Backends: []xdsserver.BackendNode{{Address: "127.0.0.1", Port: 8080, Weight: 1}},
 		LBPolicy: "ROUND_ROBIN",
-	}
-	created, err := engine.CreateRule(rule)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodDelete, "/rules/"+created.ID, nil)
+	}}
+	store.rules = rules
+	req := httptest.NewRequest(http.MethodDelete, "/rules/r1", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -184,12 +234,12 @@ func TestMethodNotAllowed(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != 405 {
-		t.Errorf("DELETE /health status = %d, want 405", w.Code)
+		t.Errorf("DELETE /health: status = %d, want 405", w.Code)
 	}
 }
 
 func TestAuthRejectNoKey(t *testing.T) {
-	handler := NewHandler(nil, 1<<20, &AuthConfig{APIKey: "secret"}, 0, 0)
+	handler := NewHandler(nil, nil, 1<<20, &AuthConfig{APIKey: "secret"}, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -199,7 +249,7 @@ func TestAuthRejectNoKey(t *testing.T) {
 }
 
 func TestAuthRejectWrongKey(t *testing.T) {
-	handler := NewHandler(nil, 1<<20, &AuthConfig{APIKey: "secret"}, 0, 0)
+	handler := NewHandler(nil, nil, 1<<20, &AuthConfig{APIKey: "secret"}, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	req.Header.Set("X-API-KEY", "wrong")
 	w := httptest.NewRecorder()
@@ -210,7 +260,7 @@ func TestAuthRejectWrongKey(t *testing.T) {
 }
 
 func TestAuthRejectQueryAPIKey(t *testing.T) {
-	handler := NewHandler(nil, 1<<20, &AuthConfig{APIKey: "secret"}, 0, 0)
+	handler := NewHandler(nil, nil, 1<<20, &AuthConfig{APIKey: "secret"}, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/health?api_key=secret", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -220,7 +270,7 @@ func TestAuthRejectQueryAPIKey(t *testing.T) {
 }
 
 func TestAuthRejectIPNotInAllowlist(t *testing.T) {
-	handler := NewHandler(nil, 1<<20, &AuthConfig{AllowedIPs: []string{"10.0.0.1"}}, 0, 0)
+	handler := NewHandler(nil, nil, 1<<20, &AuthConfig{AllowedIPs: []string{"10.0.0.1"}}, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	req.RemoteAddr = "192.168.1.1:12345"
 	w := httptest.NewRecorder()
@@ -253,16 +303,15 @@ func TestCreateRuleTrailingContent(t *testing.T) {
 }
 
 func TestUpdateRuleTrailingContent(t *testing.T) {
-	_, handler := newTestHandler(t)
-	createReq := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"trail","listen_port":9981,"listen_addr":"0.0.0.0","backends":[{"address":"127.0.0.1","port":80}]}`))
-	createReq.Header.Set("Content-Type", "application/json")
-	createW := httptest.NewRecorder()
-	handler.ServeHTTP(createW, createReq)
-	var created struct{ Data struct{ ID string } }
-	json.Unmarshal(createW.Body.Bytes(), &created)
+	engine, handler := newTestHandler(t)
+	engine.SetRules([]*xdsserver.ProxyRule{{
+		ID: "r1", Name: "trail", Protocol: "http", ListenAddr: "0.0.0.0",
+		ListenPort: 9981, Backends: []xdsserver.BackendNode{{Address: "127.0.0.1", Port: 80}},
+		LBPolicy: "ROUND_ROBIN",
+	}})
 
 	body := `{"listen_port":9982} trailing`
-	req := httptest.NewRequest(http.MethodPut, "/rules/"+created.Data.ID, strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/rules/r1", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -273,7 +322,7 @@ func TestUpdateRuleTrailingContent(t *testing.T) {
 
 func TestAuthTrustedProxy(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs:     []string{"10.0.0.1"},
 		TrustedProxies: []string{"192.168.1.100"},
 	}, 0, 0)
@@ -289,7 +338,7 @@ func TestAuthTrustedProxy(t *testing.T) {
 
 func TestAuthTrustedProxySpoofed(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs:     []string{"10.0.0.1"},
 		TrustedProxies: []string{"192.168.1.100"},
 	}, 0, 0)
@@ -305,7 +354,7 @@ func TestAuthTrustedProxySpoofed(t *testing.T) {
 
 func TestAuthXFFChainWalksRightToLeft(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs:     []string{"10.0.0.1"},
 		TrustedProxies: []string{"192.168.1.100"},
 	}, 0, 0)
@@ -314,7 +363,6 @@ func TestAuthXFFChainWalksRightToLeft(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "spoofed, 10.0.0.1, 192.168.1.100")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
-	// Right-to-left walk: skip proxy 192.168.1.100, find real client 10.0.0.1
 	if w.Code != 200 {
 		t.Errorf("spoofed prefix ignored: status = %d, want 200", w.Code)
 	}
@@ -322,7 +370,7 @@ func TestAuthXFFChainWalksRightToLeft(t *testing.T) {
 
 func TestAuthXFFChainSkipsMultipleProxies(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs:     []string{"10.0.0.1"},
 		TrustedProxies: []string{"192.168.1.100", "192.168.1.20"},
 	}, 0, 0)
@@ -338,17 +386,15 @@ func TestAuthXFFChainSkipsMultipleProxies(t *testing.T) {
 
 func TestAuthXFFSpoofedAllowedIPRejected(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs:     []string{"10.0.0.1"},
 		TrustedProxies: []string{"192.168.1.100"},
 	}, 0, 0)
-	// Client spoofs 10.0.0.1 but real client 192.168.1.99 is not allowed
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	req.RemoteAddr = "192.168.1.100:12345"
 	req.Header.Set("X-Forwarded-For", "10.0.0.1, 192.168.1.99, 192.168.1.100")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
-	// Right-to-left: skip 192.168.1.100 (proxy), return 192.168.1.99 (not proxy) → not in allowed_ips → 403
 	if w.Code != 403 {
 		t.Errorf("spoofed XFF with real untrusted client: status = %d, want 403", w.Code)
 	}
@@ -356,7 +402,7 @@ func TestAuthXFFSpoofedAllowedIPRejected(t *testing.T) {
 
 func TestAuthAllowedCIDR(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs: []string{"10.0.0.0/24"},
 	}, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -370,7 +416,7 @@ func TestAuthAllowedCIDR(t *testing.T) {
 
 func TestAuthAllowedCIDRNoMatch(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs: []string{"10.0.0.0/24"},
 	}, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -384,7 +430,7 @@ func TestAuthAllowedCIDRNoMatch(t *testing.T) {
 
 func TestAuthTrustedProxyCIDR(t *testing.T) {
 	engine, _ := newTestHandler(t)
-	handler := NewHandler(engine, 1<<20, &AuthConfig{
+	handler := NewHandler(engine, nil, 1<<20, &AuthConfig{
 		AllowedIPs:     []string{"10.0.0.1"},
 		TrustedProxies: []string{"192.168.0.0/16"},
 	}, 0, 0)

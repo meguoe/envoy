@@ -23,6 +23,12 @@ import (
 // 调用方必须持有 e.pushMu，保证规则修改与推送的原子性
 // 本函数不修改 e.rules，不触发持久化；构建失败的规则跳过但保留在内存中
 func (e *Engine) pushSnapshotLocked() error {
+	version := fmt.Sprintf("%d", atomic.AddUint64(&e.versionSeq, 1))
+	return e.pushSnapshotLockedWithVersion(version)
+}
+
+// pushSnapshotLockedWithVersion 构建快照并推送到 Envoy，使用指定版本号
+func (e *Engine) pushSnapshotLockedWithVersion(version string) error {
 	// 在 pushMu 保护下取快照，此时不会有其他 CRUD 操作修改 rules
 	e.mu.RLock()
 	snapshot := make(map[string]*ProxyRule, len(e.rules))
@@ -61,7 +67,14 @@ func (e *Engine) pushSnapshotLocked() error {
 		resources[resourcev3.ListenerType] = lis
 	}
 
-	version := fmt.Sprintf("%d", atomic.AddUint64(&e.versionSeq, 1))
+	if tracker, ok := e.callbacks.(interface {
+		TrackExpected(int64, []string)
+	}); ok {
+		var revision int64
+		if _, err := fmt.Sscanf(version, "%d", &revision); err == nil {
+			tracker.TrackExpected(revision, expectedTypeURLs(resources))
+		}
+	}
 
 	snap, err := cache.NewSnapshot(version, resources)
 	if err != nil {
@@ -75,7 +88,16 @@ func (e *Engine) pushSnapshotLocked() error {
 		return fmt.Errorf("设置快照失败: %w", err)
 	}
 
-	log.Printf("快照推送完成  ver=%s  rules=%d  resources=[EDS=%d CDS=%d RDS=%d LDS=%d]",
-		version, len(names), len(eps), len(cls), len(rts), len(lis))
+	if len(names) > 0 {
+		log.Printf("快照推送  ver=%s  rules=%d", version, len(names))
+	}
 	return nil
+}
+
+func expectedTypeURLs(resources map[resourcev3.Type][]types.Resource) []string {
+	typeURLs := make([]string, 0, len(resources))
+	for typeURL := range resources {
+		typeURLs = append(typeURLs, string(typeURL))
+	}
+	return typeURLs
 }

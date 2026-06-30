@@ -28,7 +28,6 @@ type Config struct {
 	NodeID       string `yaml:"node_id"`
 	GRPCAddr     string `yaml:"grpc_addr"`
 	APIAddr      string `yaml:"api_addr"`
-	StorePath    string `yaml:"store_path"`
 	LogLevel     string `yaml:"log_level"`
 	MaxBodyBytes int64  `yaml:"max_body_bytes"`
 	Auth         struct {
@@ -59,6 +58,13 @@ type Config struct {
 		RPS   float64 `yaml:"rps"`
 		Burst float64 `yaml:"burst"`
 	} `yaml:"rate_limit"`
+	Database struct {
+		Host     string `yaml:"host"`
+		Port     string `yaml:"port"`
+		User     string `yaml:"user"`
+		Password string `yaml:"password"`
+		DBName   string `yaml:"dbname"`
+	} `yaml:"database"`
 }
 
 func Load(configPath string) (Config, error) {
@@ -101,8 +107,20 @@ func (c Config) validate() error {
 	if err := validateListenAddr(c.APIAddr, "api_addr"); err != nil {
 		return err
 	}
-	if c.StorePath == "" {
-		return fmt.Errorf("store_path 不能为空")
+	if c.Database.Host == "" {
+		return fmt.Errorf("database.host 不能为空")
+	}
+	if c.Database.Port == "" {
+		return fmt.Errorf("database.port 不能为空")
+	}
+	if portNum, err := strconv.Atoi(c.Database.Port); err != nil || portNum < 1 || portNum > 65535 {
+		return fmt.Errorf("database.port 无效 %q: 必须是 1-65535", c.Database.Port)
+	}
+	if c.Database.User == "" {
+		return fmt.Errorf("database.user 不能为空")
+	}
+	if c.Database.DBName == "" {
+		return fmt.Errorf("database.dbname 不能为空")
 	}
 	level := strings.ToUpper(strings.TrimSpace(c.LogLevel))
 	if !validLogLevels[level] {
@@ -211,10 +229,13 @@ func defaultConfig() Config {
 		NodeID:       "envoy-local",
 		GRPCAddr:     defaultGRPCAddr,
 		APIAddr:      defaultAPIAddr,
-		StorePath:    "data/rules.json",
 		LogLevel:     "INFO",
 		MaxBodyBytes: defaultMaxBodyBytes,
 	}
+	cfg.Database.Host = "localhost"
+	cfg.Database.Port = "7032"
+	cfg.Database.User = "hiddos"
+	cfg.Database.DBName = "hiddos-ecp"
 	cfg.Auth.AllowedIPs = []string{"127.0.0.1"}
 	cfg.HttpTimeout.ReadHeaderTimeout = 5 * time.Second
 	cfg.HttpTimeout.ReadTimeout = 10 * time.Second

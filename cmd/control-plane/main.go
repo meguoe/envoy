@@ -3,12 +3,17 @@ package main
 // main.go —— 程序入口 + 服务器启动
 //
 // 启动顺序：
-//   1. 创建 xDS 引擎
-//   2. 从文件加载历史规则
-//   3. 启动 gRPC（协程）
-//   4. 启动 HTTP API（协程）
-//   5. 推送初始快照
-//   6. 等待信号，优雅关闭
+//   1. 初始化存储
+//   2. 创建 xDS 引擎
+//   3. 从数据库加载历史规则
+//   4. 启动 gRPC（协程）
+//   5. 启动 HTTP API（协程）
+//   6. 推送初始快照
+//   7. 启动规则轮询器
+//   8. 等待信号，优雅关闭
+//
+// 数据库是唯一的规则来源。服务只通过 HTTP API 写入数据库，
+// 关闭时不回写，避免覆盖人工直接修改的规则。
 
 import (
 	"context"
@@ -51,14 +56,28 @@ func main() {
 		httpserver.EnableStructuredLogging(true)
 	}
 
-	// 1. 创建 xDS 引擎
-	engine = xdsserver.NewEngine(cfg.NodeID, cfg.ConnectTimeout, cfg.UDPIdleTimeout)
-	engine.SetOnRulesChanged(func(rules []*xdsserver.ProxyRule) error {
-		return store.Save(cfg.StorePath, rules)
-	})
+	// 1. 初始化存储
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	dataStore, err := store.NewPgStore(startupCtx, store.BuildPgDSN(cfg.Database.Host, cfg.Database.Port, cfg.Database.User, cfg.Database.Password, cfg.Database.DBName))
+	cancelStartup()
+	if err != nil {
+		log.Fatalf("初始化存储失败: %v", err)
+	}
+	defer dataStore.Close()
 
-	// 2. 从文件加载历史规则
-	rules, err := store.Load(cfg.StorePath)
+	// 2. 创建 xDS 引擎
+	engine = xdsserver.NewEngine(cfg.NodeID, cfg.ConnectTimeout, cfg.UDPIdleTimeout)
+
+	// 2.1 注册 ACK/NACK 回调
+	ackCb := xdsserver.NewAckCallbacks(dataStore, func(rev int64) {
+		engine.SetDeployedRevision(rev)
+	})
+	engine.SetCallbacks(ackCb)
+
+	// 3. 加载历史规则
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 5*time.Second)
+	rules, err := dataStore.Load(loadCtx)
+	cancelLoad()
 	if err != nil {
 		log.Fatalf("加载数据失败: %v", err)
 	}
@@ -66,7 +85,15 @@ func main() {
 		engine.SetRules(rules)
 	}
 
-	// 3. 启动 gRPC 服务器
+	// 加载当前 revision
+	revCtx, cancelRev := context.WithTimeout(context.Background(), 5*time.Second)
+	currentRev, err := dataStore.LoadRevision(revCtx)
+	cancelRev()
+	if err != nil {
+		log.Printf("加载 revision 失败: %v", err)
+	}
+
+	// 4. 启动 gRPC 服务器
 	var grpcOpts []grpc.ServerOption
 	if creds, err := cfg.TLSConfig().ServerCredentials(); err != nil {
 		log.Fatalf("加载 TLS 凭证失败: %v", err)
@@ -79,7 +106,7 @@ func main() {
 		grpcErr <- engine.StartGRPC(cfg.GRPCAddr, grpcSrv)
 	}()
 
-	// 4. 启动 HTTP API 服务器
+	// 5. 启动 HTTP API 服务器
 	var authCfg *httpserver.AuthConfig
 	if cfg.HasAuth() {
 		authCfg = &httpserver.AuthConfig{
@@ -90,7 +117,7 @@ func main() {
 	}
 	httpSrv = &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           httpserver.NewHandler(engine, cfg.MaxBodyBytes, authCfg, cfg.RateLimit.RPS, cfg.RateLimit.Burst),
+		Handler:           httpserver.NewHandler(engine, dataStore, cfg.MaxBodyBytes, authCfg, cfg.RateLimit.RPS, cfg.RateLimit.Burst),
 		ReadHeaderTimeout: cfg.HttpTimeout.ReadHeaderTimeout,
 		ReadTimeout:       cfg.HttpTimeout.ReadTimeout,
 		WriteTimeout:      cfg.HttpTimeout.WriteTimeout,
@@ -103,9 +130,7 @@ func main() {
 	}
 	httpErr := make(chan error, 1)
 	go func() {
-		log.Printf("HTTP API 启动 %s", cfg.APIAddr)
 		if cfg.HasHTTPS() {
-			log.Printf("HTTPS 已启用")
 			httpErr <- httpSrv.ListenAndServeTLS(cfg.HTTPS.CertFile, cfg.HTTPS.KeyFile)
 		} else {
 			httpErr <- httpSrv.ListenAndServe()
@@ -123,25 +148,16 @@ func main() {
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	// 5. 推送初始快照
-	if err := engine.PushSnapshot(); err != nil {
-		log.Fatalf("初始快照推送失败: %v", err)
+	// 6. 推送初始快照
+	if err := engine.ReplaceRulesAndPushWithVersion(rules, currentRev); err != nil {
+		log.Printf("初始快照推送失败: %v", err)
 	}
+	stopPoll := startRulePoller(dataStore, engine, 5*time.Second)
+	defer stopPoll()
 
-	log.Printf("xDS 控制面就绪")
-	log.Printf("  gRPC (ADS)  %s", cfg.GRPCAddr)
-	log.Printf("  HTTP (API)  %s", cfg.APIAddr)
-	log.Printf("  数据文件     %s", cfg.StorePath)
-	log.Printf("")
-	log.Printf("  GET    /nodes          获取代理节点")
-	log.Printf("  GET    /health         服务健康检查")
-	log.Printf("  GET    /metrics        服务运行指标")
-	log.Printf("  GET    /rules          获取规则列表")
-	log.Printf("  POST   /rules          创建代理规则")
-	log.Printf("  PUT    /rules/:id      更新代理规则")
-	log.Printf("  DELETE /rules/:id      删除代理规则")
+	log.Printf("xDS 控制面就绪  gRPC=%s  HTTP=%s", cfg.GRPCAddr, cfg.APIAddr)
 
-	// 6. 等待信号或服务器错误
+	// 7. 等待信号或服务器错误
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -156,18 +172,13 @@ func main() {
 		}
 	}
 
-	// 最终持久化一次
-	if err := store.Save(cfg.StorePath, engine.ListRules()); err != nil {
-		log.Printf("关闭前持久化失败: %v", err)
-	}
-
 	// 给进行中的请求 5 秒完成时间
 	shutdownTimeout := 5 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	// HTTP 优雅关闭
-	if err := httpSrv.Shutdown(ctx); err != nil {
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 关闭失败: %v", err)
 	} else {
 		log.Printf("HTTP 已关闭")
@@ -179,4 +190,58 @@ func main() {
 
 	log.Printf("服务已停止")
 	engine.Close()
+}
+
+func startRulePoller(dataStore *store.PgStore, engine *xdsserver.Engine, interval time.Duration) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				loadCtx, cancelLoad := context.WithTimeout(ctx, 5*time.Second)
+				dbRev, err := dataStore.LoadRevision(loadCtx)
+				cancelLoad()
+				if err != nil {
+					log.Printf("规则轮询检查失败: %v", err)
+					continue
+				}
+				engineRev := engine.KnownRevision()
+				if dbRev == engineRev {
+					continue
+				}
+
+				// 检查是否已 failed 且 revision 未变化
+				statusCtx, cancelStatus := context.WithTimeout(ctx, 5*time.Second)
+				status, err := dataStore.PushStatus(statusCtx, dbRev)
+				cancelStatus()
+				if err == nil && status == "failed" {
+					log.Printf("规则轮询跳过已失败的 revision %d", dbRev)
+					continue
+				}
+
+				rulesCtx, cancelRules := context.WithTimeout(ctx, 5*time.Second)
+				rules, err := dataStore.Load(rulesCtx)
+				cancelRules()
+				if err != nil {
+					log.Printf("规则轮询加载失败: %v", err)
+					continue
+				}
+				if err := dataStore.LogPushPending(ctx, dbRev); err != nil {
+					log.Printf("记录 push pending 失败: %v", err)
+				}
+				if err := engine.ReplaceRulesAndPushWithVersion(rules, dbRev); err != nil {
+					log.Printf("规则轮询推送失败: %v", err)
+					_ = dataStore.MarkPushFailed(ctx, dbRev, err.Error())
+					continue
+				}
+				log.Printf("规则轮询发现变更并推送: rules=%d rev=%d", len(rules), dbRev)
+			}
+		}
+	}()
+	return cancel
 }

@@ -14,10 +14,10 @@ import (
 )
 
 type slog struct {
-	Level   string `json:"level"`
-	Msg     string `json:"msg"`
-	Time    string `json:"time"`
-	Attrs   any    `json:"attrs,omitempty"`
+	Level string `json:"level"`
+	Msg   string `json:"msg"`
+	Time  string `json:"time"`
+	Attrs any    `json:"attrs,omitempty"`
 }
 
 var slogWriter io.Writer = os.Stderr
@@ -50,7 +50,7 @@ func slogPrint(level, msg string, attrs map[string]any) {
 	slogWriter.Write(b)
 }
 
-func slogInfo(msg string, attrs map[string]any) { slogPrint("INFO", msg, attrs) }
-func slogWarn(msg string, attrs map[string]any) { slogPrint("WARN", msg, attrs) }
+func slogInfo(msg string, attrs map[string]any)  { slogPrint("INFO", msg, attrs) }
+func slogWarn(msg string, attrs map[string]any)  { slogPrint("WARN", msg, attrs) }
 func slogError(msg string, attrs map[string]any) { slogPrint("ERROR", msg, attrs) }
 func slogDebug(msg string, attrs map[string]any) { slogPrint("DEBUG", msg, attrs) }
