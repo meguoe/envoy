@@ -55,7 +55,7 @@ envoy-control-plane/
 
 ### 前置条件
 
-- Go 1.25+
+- Go 1.25+（`go.mod` 当前要求；已用 Go 1.26.3 验证）
 - PostgreSQL 14+
 
 ### 1. 配置环境
@@ -161,6 +161,7 @@ DB_PORT=5432
 DB_USER=postgres
 DB_PASSWORD=your_password
 DB_NAME=envoy_cp
+DB_SSLMODE=disable   # 本地可用 disable；生产跨主机建议 require 或 verify-full
 API_KEY=your_api_key
 ```
 

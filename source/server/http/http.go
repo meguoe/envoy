@@ -105,6 +105,14 @@ func respErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, apiResp{Code: status, Success: false, Message: msg})
 }
 
+// respInternal 记录内部错误，但不把底层错误细节返回给客户端。
+func respInternal(w http.ResponseWriter, msg string, err error) {
+	if err != nil {
+		slog.Error(msg, "error", err)
+	}
+	respErr(w, 500, msg)
+}
+
 // writeJSON 将结构体序列化为 JSON 并写入 HTTP 响应，自动设置 Content-Type 和 X-Request-Id 头。
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	body, err := json.Marshal(v)
@@ -319,7 +327,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	id, err := xdsserver.GenerateID()
 	if err != nil {
-		respErr(w, 500, "生成规则 ID 失败")
+		respInternal(w, "生成规则 ID 失败", err)
 		return
 	}
 	rule.ID = id
@@ -340,7 +348,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			respErr(w, 400, err.Error())
 			return
 		}
-		respErr(w, 500, fmt.Sprintf("保存规则失败: %v", err))
+		respInternal(w, "保存规则失败", err)
 		return
 	}
 
@@ -356,7 +364,7 @@ func (s *Server) handleGetOne(w http.ResponseWriter, r *http.Request, id string)
 	defer cancel()
 	rule, err := s.store.LoadOne(ctx, id)
 	if err != nil {
-		respErr(w, 500, fmt.Sprintf("读取规则失败: %v", err))
+		respInternal(w, "读取规则失败", err)
 		return
 	}
 	if rule == nil {
@@ -439,7 +447,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, id string)
 			respErr(w, 400, err.Error())
 			return
 		}
-		respErr(w, 500, fmt.Sprintf("保存规则失败: %v", err))
+		respInternal(w, "保存规则失败", err)
 		return
 	}
 
@@ -455,7 +463,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	rules, err := s.store.Load(ctx)
 	if err != nil {
-		respErr(w, 500, fmt.Sprintf("读取规则失败: %v", err))
+		respInternal(w, "读取规则失败", err)
 		return
 	}
 	respOK(w, rules)
@@ -485,7 +493,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, id string)
 			respErr(w, 404, "规则不存在")
 			return
 		}
-		respErr(w, 500, fmt.Sprintf("删除规则失败: %v", err))
+		respInternal(w, "删除规则失败", err)
 		return
 	}
 

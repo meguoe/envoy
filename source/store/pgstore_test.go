@@ -39,6 +39,7 @@ func testDSN(t *testing.T, dbname string) string {
 
 // TestBuildPgDSN 测试 BuildPgDSN 函数生成正确的 PostgreSQL 连接字符串。
 func TestBuildPgDSN(t *testing.T) {
+	t.Setenv("DB_SSLMODE", "")
 	dsn := BuildPgDSN("localhost", "5432", "user", "pass", "mydb")
 	want := "postgres://user:pass@localhost:5432/mydb?sslmode=disable"
 	if dsn != want {
@@ -55,6 +56,13 @@ func TestBuildPgDSN(t *testing.T) {
 	want = "postgres://user:p%40ss%3Awo%2Frd@localhost:5432/my%20db?sslmode=disable"
 	if dsn != want {
 		t.Errorf("BuildPgDSN (escaped) = %q, want %q", dsn, want)
+	}
+
+	t.Setenv("DB_SSLMODE", "verify-full")
+	dsn = BuildPgDSN("db.example.com", "5432", "user", "pass", "mydb")
+	want = "postgres://user:pass@db.example.com:5432/mydb?sslmode=verify-full"
+	if dsn != want {
+		t.Errorf("BuildPgDSN (sslmode) = %q, want %q", dsn, want)
 	}
 }
 

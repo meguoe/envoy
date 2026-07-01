@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -348,12 +349,18 @@ func (s *PgStore) PushStatus(ctx context.Context, revision int64) (string, error
 
 // BuildPgDSN 根据主机、端口、用户名、密码和数据库名构建 PostgreSQL DSN 连接字符串。
 func BuildPgDSN(host, port, user, password, dbname string) string {
-	u := url.URL{
-		Scheme:   "postgres",
-		Host:     net.JoinHostPort(host, port),
-		Path:     dbname,
-		RawQuery: "sslmode=disable",
+	sslmode := strings.TrimSpace(os.Getenv("DB_SSLMODE"))
+	if sslmode == "" {
+		sslmode = "disable"
 	}
+	u := url.URL{
+		Scheme: "postgres",
+		Host:   net.JoinHostPort(host, port),
+		Path:   dbname,
+	}
+	q := u.Query()
+	q.Set("sslmode", sslmode)
+	u.RawQuery = q.Encode()
 	if password != "" {
 		u.User = url.UserPassword(user, password)
 	} else {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,12 +17,18 @@ import (
 
 // mockStore 是用于单元测试的内存存储实现。
 type mockStore struct {
-	rules    []*xdsserver.ProxyRule
-	revision int64
+	rules      []*xdsserver.ProxyRule
+	revision   int64
+	mutateErr  error
+	loadErr    error
+	loadOneErr error
 }
 
 // MutateRulesAndBumpRevision 在内存中执行规则变更并递增 revision。
 func (m *mockStore) MutateRulesAndBumpRevision(_ context.Context, mutate func([]*xdsserver.ProxyRule) ([]*xdsserver.ProxyRule, error)) ([]*xdsserver.ProxyRule, int64, error) {
+	if m.mutateErr != nil {
+		return nil, 0, m.mutateErr
+	}
 	rules, err := mutate(m.rules)
 	if err != nil {
 		return nil, 0, err
@@ -33,11 +40,17 @@ func (m *mockStore) MutateRulesAndBumpRevision(_ context.Context, mutate func([]
 
 // Load 返回内存中所有规则。
 func (m *mockStore) Load(_ context.Context) ([]*xdsserver.ProxyRule, error) {
+	if m.loadErr != nil {
+		return nil, m.loadErr
+	}
 	return m.rules, nil
 }
 
 // LoadOne 根据 ID 查找并返回单条规则。
 func (m *mockStore) LoadOne(_ context.Context, id string) (*xdsserver.ProxyRule, error) {
+	if m.loadOneErr != nil {
+		return nil, m.loadOneErr
+	}
 	for _, r := range m.rules {
 		if r.ID == id {
 			return r, nil
@@ -242,6 +255,30 @@ func TestListRules200(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Errorf("GET /rules status = %d, want 200", w.Code)
+	}
+}
+
+// TestInternalErrorsAreRedacted 测试 500 响应不会暴露底层错误细节。
+func TestInternalErrorsAreRedacted(t *testing.T) {
+	engine := xdsserver.NewEngine("test-node", time.Second, 60*time.Second)
+	store := &mockStore{loadErr: errors.New("postgres password leaked")}
+	handler := NewHandler(engine, store, nil, 1<<20, nil, 0, 0)
+
+	req := httptest.NewRequest(http.MethodGet, "/rules", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != 500 {
+		t.Fatalf("GET /rules status = %d, want 500", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "postgres password leaked") {
+		t.Fatalf("response leaked internal error: %s", w.Body.String())
+	}
+	var resp apiResp
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response JSON: %v", err)
+	}
+	if resp.Message != "读取规则失败" {
+		t.Fatalf("message = %q, want %q", resp.Message, "读取规则失败")
 	}
 }
 
