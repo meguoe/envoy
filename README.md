@@ -1,281 +1,305 @@
-# Envoy xDS 动态代理控制面
+# Envoy xDS Control Plane
 
-一个小型 Go xDS control plane。通过 HTTP API 写入代理规则，控制面生成 Envoy v3 xDS 资源并通过 Delta ADS 推送给 Envoy。
+轻量级 Envoy xDS 控制面，基于 Go + PostgreSQL，支持 HTTP API 管理代理规则，通过 gRPC xDS 动态下发配置到 Envoy。
 
-Envoy API 文档：https://www.envoyproxy.io/docs/envoy/v1.38.3/api-v3/api
+## 特性
 
-## 当前能力
-
-- 支持 HTTP 代理规则：LDS + RDS + CDS + EDS。
-- 支持 UDP 代理规则：LDS + STATIC CDS。
-- Envoy 到控制面使用 gRPC mTLS。
-- HTTP 管理 API 支持 HTTPS、IP 白名单、`X-API-KEY`、速率限制、请求体大小限制。
-- 规则持久化到 PostgreSQL 数据库。
-- 暴露 `/health`、`/nodes`、`/metrics`。
-
-不支持：域名路由、多路由匹配、TLS 下游终止、Web UI。
+- **xDS v3 Delta gRPC**：ADS 聚合发现服务，支持 CDS/LDS/RDS/EDS 全量推送
+- **事件驱动推送**：规则变更即时推送，30s 兜底 ticker 保证最终一致
+- **PostgreSQL 持久化**：数据库为唯一规则源，支持事务安全的原子修改
+- **ACK/NACK 追踪**：完整追踪 Envoy 对每个 revision 的响应状态
+- **mTLS 双向认证**：xDS gRPC 和 HTTP API 均支持 TLS
+- **HTTP + UDP 协议**：支持 HTTP 代理和 UDP 代理
+- **CLI 命令系统**：setup、initdb、config、cert 等便捷命令
+- **结构化日志**：支持 JSON 格式输出，便于 ELK/Loki 聚合
+- **请求限流**：基于 IP 的令牌桶算法，可配置 RPS 和突发容量
 
 ## 目录结构
 
-```text
-cmd/control-plane/main.go       # 启动、配置加载、服务器生命周期
-internal/config/                # config.yaml 加载和校验
-internal/store/                 # PostgreSQL 持久化
-internal/server/http/           # 管理 API、认证、限流、日志、metrics
-internal/server/xds/            # 规则模型、xDS 引擎、资源构建、mTLS
-config.yaml                     # 控制面配置
-envoy.yaml                      # 本地 Envoy bootstrap
-tools/generate-certs.sh         # 本地测试证书生成
+```
+envoy-control-plane/
+├── source/
+│   ├── cmd/main.go                 # 入口、CLI 命令、服务启动
+│   ├── config/
+│   │   ├── config.go               # 配置加载、校验、默认值
+│   │   ├── setup.go                # 交互式配置向导
+│   │   └── cert.go                 # TLS 证书生成（mTLS + HTTPS）
+│   ├── server/
+│   │   ├── http/                   # HTTP API 层
+│   │   │   ├── http.go             # 路由、CRUD 处理、响应格式
+│   │   │   ├── auth.go             # API_KEY 认证（支持热更新）
+│   │   │   ├── ratelimit.go        # 令牌桶限流（基于 IP）
+│   │   │   ├── logger.go           # 标准库 slog 日志配置
+│   │   │   ├── metrics.go          # 运行指标计数器
+│   │   └── xds/                    # xDS 引擎层
+│   │       ├── engine.go           # 核心引擎：规则管理、快照推送、gRPC 服务
+│   │       ├── model.go            # 数据模型：ProxyRule、BackendNode、校验
+│   │       ├── snapshot.go         # Envoy 资源构建：LDS/RDS/CDS/EDS
+│   │       ├── resource.go         # 单条规则的资源构建（HTTP + UDP）
+│   │       ├── callbacks.go        # ACK/NACK 追踪
+│   │       ├── worker.go           # 事件驱动推送 worker
+│   │       ├── cache.go            # 增量快照缓存同步
+│   │       ├── tls.go              # gRPC mTLS 配置
+│   │       ├── helper.go           # 辅助函数（protobuf 工具）
+│   │       └── grpc_interceptor.go # gRPC 拦截器（日志 + 指标）
+│   └── store/
+│       └── pgstore.go              # PostgreSQL 存储：规则 CRUD + revision 管理
+├── config.yaml                     # 主配置文件
+├── .env.example                    # 环境变量模板
+├── envoy.yaml                      # Envoy bootstrap 配置
+├── go.mod                          # Go 模块定义
+└── certs/                          # 证书目录（gitignore）
 ```
 
 ## 快速开始
 
+### 前置条件
+
+- Go 1.25+
+- PostgreSQL 14+
+
+### 1. 配置环境
+
 ```bash
-# 1. 生成证书
-./tools/generate-certs.sh
+# 交互式配置向导（数据库、API 密钥）
+xds-control-plane setup
 
-# 2. 启动控制面（数据库需预先存在，表会自动创建）
-go run ./cmd/control-plane
+# 或手动复制并编辑
+cp .env.example .env
+```
 
-# 3. 启动 Envoy
+### 2. 初始化数据库
+
+```bash
+xds-control-plane initdb
+```
+
+### 3. 生成证书
+
+```bash
+# 生成 mTLS（xDS）+ HTTPS（API）证书
+xds-control-plane cert
+
+# 仅生成 mTLS 证书
+xds-control-plane cert --mtls
+
+# 仅生成 HTTPS 证书
+xds-control-plane cert --https
+```
+
+### 4. 启动服务
+
+```bash
+xds-control-plane
+```
+
+生产环境用 systemd、Docker、supervisor 或 Kubernetes 管理进程。
+
+### 5. 启动 Envoy
+
+```bash
 envoy -c envoy.yaml --log-level info
 ```
 
-当前 `config.yaml` 开启了 HTTPS，所以管理 API 默认使用：
+## CLI 命令
 
-```bash
-curl -k https://127.0.0.1:18000/health
+| 命令 | 说明 |
+|------|------|
+| `setup` | 交互式配置向导 |
+| `initdb` | 初始化数据库表结构 |
+| `initdb --force` | 强制重建数据库（需确认） |
+| `config --init` | 生成默认配置文件和证书 |
+| `config --validate` | 校验配置文件 |
+| `cert` | 生成所有证书（mTLS + HTTPS） |
+| `cert --mtls` | 仅生成 mTLS 证书 |
+| `cert --https` | 仅生成 HTTPS 证书 |
+
+## 配置
+
+### config.yaml
+
+```yaml
+server:
+    node_id: envoy-local        # Envoy 节点 ID
+    api_addr: 127.0.0.1:18000   # HTTP API 地址
+    grpc_addr: 127.0.0.1:18001  # xDS gRPC 地址
+    log_level: INFO             # 日志级别: DEBUG, INFO, WARN, ERROR
+
+xds:
+    connect_timeout: 1s         # Envoy 连接超时
+    udp_idle_timeout: 60s       # UDP 空闲超时
+    tls:
+        enabled: true
+        ca_cert: "certs/mtls/ca.crt"
+        server_key: "certs/mtls/server.key"
+        server_cert: "certs/mtls/server.crt"
+        client_uri: "spiffe://local/envoy/envoy-local"
+
+api:
+    max_body_bytes: 5242880     # 请求体上限 (5MB)
+    auth:
+        enabled: true           # 启用 API_KEY 认证
+    tls:
+        enabled: true
+        key_file: "certs/https/server.key"
+        cert_file: "certs/https/server.crt"
+    rate_limit:
+        rps: 20                 # 每秒请求数
+        burst: 40               # 突发容量
+    timeout:
+        read_timeout: 10s
+        write_timeout: 10s
+        idle_timeout: 60s
+        read_header_timeout: 5s
 ```
 
-如果把 `https.enabled` 改成 `false`，再使用：
+### .env（敏感配置）
+
+```bash
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=your_password
+DB_NAME=envoy_cp
+API_KEY=your_api_key
+```
+
+## HTTP API
+
+所有 API 请求需要 `X-API-KEY` 头认证（当 `api.auth.enabled=true`）。
+
+### 健康检查
 
 ```bash
 curl http://127.0.0.1:18000/health
 ```
 
-## 编译和检查
+### 规则管理
 
 ```bash
-go build -o xds-control-plane ./cmd/control-plane
-go test ./...
-go vet ./...
-```
-
-如果本地沙箱限制 Go 默认 cache：
-
-```bash
-GOCACHE=/private/tmp/envoy-go-cache go test ./...
-GOCACHE=/private/tmp/envoy-go-cache go build -o xds-control-plane ./cmd/control-plane
-```
-
-## 启动参数
-
-```bash
-go run ./cmd/control-plane -config config.yaml
-go run ./cmd/control-plane -json-log
-```
-
-- `-config`：指定配置文件，默认 `config.yaml`。
-- `-json-log`：HTTP 访问日志输出 JSON。
-
-## 配置
-
-当前配置以 `config.yaml` 为准。README 只说明字段语义，不复制配置内容。
-
-- `api_addr` 是管理 API 地址。
-- `grpc_addr` 是 Envoy xDS ADS 地址。
-- `database.*` 配置 PostgreSQL 数据库连接。
-- `log_level` 控制普通日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`。
-- `max_body_bytes` 限制管理 API 请求体大小。
-- `connect_timeout` 用于生成 Envoy cluster 的连接超时。
-- `udp_idle_timeout` 用于 UDP proxy idle timeout。
-- `rate_limit.rps` 和 `rate_limit.burst` 控制每个客户端 IP 的令牌桶限流。
-- `http_timeout.*` 控制管理 API 的 header、读、写、空闲超时。
-- `tls.*` 是 gRPC mTLS 配置，控制面验证 Envoy 客户端证书 URI SAN 等于 `client_uri`。
-- `https.*` 只保护 HTTP 管理 API，不做客户端证书认证。
-- `allowed_ips` 为空时跳过 IP 白名单。
-- `api_key` 为空时跳过 API Key 校验；非空时只接受 `X-API-KEY` header。
-- `trusted_proxies` 只影响可信代理下的 `X-Forwarded-For` 解析和限流 key。
-
-## Envoy Bootstrap
-
-`envoy.yaml` 使用 Delta gRPC ADS：
-
-- `node.id`: `envoy-local`，必须和 `config.yaml` 的 `node_id` 对齐。
-- `xds_cluster`: 指向 `127.0.0.1:18001`。
-- Envoy 使用 `certs/mtls/client.crt` 和 `client.key` 作为客户端证书。
-- Envoy 校验控制面服务端证书 DNS SAN 为 `xds-server`。
-- 控制面校验 Envoy 客户端证书 URI SAN 为 `spiffe://local/envoy/envoy-local`。
-
-如果看到 `CERTIFICATE_VERIFY_FAILED: SAN matcher`，先检查 `envoy.yaml` 的 `match_typed_subject_alt_names` 是否匹配服务端证书 SAN。
-
-## 规则模型
-
-```json
-{
-  "id": "server-generated",
-  "name": "web",
-  "protocol": "http",
-  "listen_addr": "0.0.0.0",
-  "listen_port": 9981,
-  "backends": [
-    {"address": "127.0.0.1", "port": 8080, "weight": 1}
-  ],
-  "lb_policy": "ROUND_ROBIN"
-}
-```
-
-字段规则：
-
-- `id`：服务端生成，创建时客户端传入会被忽略。
-- `name`：唯一；只允许字母、数字、`_`、`-`，首尾必须是字母或数字。更新时不允许改名。
-- `protocol`：`http` 或 `udp`，默认 `http`。
-- `listen_addr`：合法 IP 或 DNS 名称。
-- `listen_port`：`10..65535`。
-- `backends`：至少 1 个；`address` 为合法 IP 或 DNS；`port` 为 `1..65535`；`weight` 为 0 时归一化成 1。
-- `lb_policy`：`ROUND_ROBIN`、`LEAST_REQUEST`、`RANDOM`、`RING_HASH`，默认 `ROUND_ROBIN`。
-
-同一个控制面内，`name` 不能重复，`listen_addr + listen_port + protocol` 不能重复。
-
-## HTTP API
-
-统一响应：
-
-```json
-{
-  "code": 200,
-  "success": true,
-  "message": "ok",
-  "data": {}
-}
-```
-
-### 创建规则
-
-```bash
-curl -k -X POST https://127.0.0.1:18000/rules \
-  -H 'Content-Type: application/json' \
+# 创建规则
+curl -X POST http://127.0.0.1:18000/rules \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: your_key" \
   -d '{
-    "name": "web",
+    "name": "web-service",
     "protocol": "http",
     "listen_addr": "0.0.0.0",
-    "listen_port": 9981,
+    "listen_port": 8080,
     "backends": [
-      {"address": "127.0.0.1", "port": 8080, "weight": 1}
+      {"address": "10.0.0.1", "port": 80, "weight": 1},
+      {"address": "10.0.0.2", "port": 80, "weight": 1}
     ],
     "lb_policy": "ROUND_ROBIN"
   }'
-```
 
-### UDP 规则
+# 列出所有规则
+curl http://127.0.0.1:18000/rules \
+  -H "X-API-KEY: your_key"
 
-```bash
-curl -k -X POST https://127.0.0.1:18000/rules \
-  -H 'Content-Type: application/json' \
+# 获取单条规则
+curl http://127.0.0.1:18000/rules/{id} \
+  -H "X-API-KEY: your_key"
+
+# 更新规则
+curl -X PUT http://127.0.0.1:18000/rules/{id} \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: your_key" \
   -d '{
-    "name": "dns",
-    "protocol": "udp",
-    "listen_addr": "0.0.0.0",
-    "listen_port": 1053,
     "backends": [
-      {"address": "127.0.0.1", "port": 53}
+      {"address": "10.0.0.3", "port": 80, "weight": 2}
     ]
   }'
+
+# 删除规则
+curl -X DELETE http://127.0.0.1:18000/rules/{id} \
+  -H "X-API-KEY: your_key"
 ```
 
-### 更新规则
+### 其他端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查 + 运行状态 |
+| `/metrics` | GET | HTTP + gRPC 指标 |
+| `/nodes` | GET | 已连接的 Envoy 节点信息 |
+
+## 架构
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│  HTTP API   │────▶│  PostgreSQL  │◀────│  CLI Setup  │
+│  :18000     │     │  规则存储     │     │  initdb     │
+└──────┬──────┘     └──────────────┘     └─────────────┘
+       │
+       ▼
+┌──────────────┐     ┌──────────────┐     ┌─────────────┐
+│  xDS Engine  │────▶│  gRPC Server │────▶│   Envoy     │
+│  规则→快照    │     │  :18001      │     │  mTLS 客户端 │
+└──────┬──────┘     └──────────────┘     └─────────────┘
+       │
+       ▼
+┌──────────────┐
+│ Push Worker  │
+│ 事件+兜底     │
+└──────────────┘
+```
+
+核心数据流：HTTP API → PostgreSQL (事务) → Worker 通知 → xDS Engine → gRPC → Envoy
+
+## 开发
 
 ```bash
-curl -k -X PUT https://127.0.0.1:18000/rules/{id} \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "listen_port": 9982,
-    "backends": [
-      {"address": "127.0.0.1", "port": 8081}
-    ]
-  }'
+# 编译
+go build -o xds-control-plane ./source/cmd
+
+# 运行测试
+go test ./...
+
+# 运行指定包测试
+go test -v ./source/server/xds/...
+go test -run TestValidateRule ./source/server/xds/...
+
+# 格式化代码
+gofmt -w .
+
+# 前台运行（调试）
+go run ./source/cmd
+
+# 以 JSON 日志运行
+go run ./source/cmd -json-log
 ```
 
-更新语义：
+## 数据模型
 
-- URL 里的 `{id}` 为准，body 里的 `id` 被忽略。
-- `name` 继承旧值，不允许通过更新修改。
-- 未传的 `protocol`、`listen_addr`、`listen_port`、`lb_policy`、`backends` 会继承旧值。
-- body 后有多余 JSON 内容会返回 400。
+### ProxyRule
 
-### 查询和删除
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | 是 | 规则名，仅允许字母、数字、下划线、短横线、点号，且首尾必须为字母或数字 |
+| `protocol` | string | 否 | 协议类型：`http`（默认）、`udp` |
+| `listen_addr` | string | 是 | 监听地址，IP 或 DNS 名称 |
+| `listen_port` | uint32 | 是 | 监听端口，范围 10-65535 |
+| `backends` | array | 是 | 后端节点列表，至少一个 |
+| `lb_policy` | string | 否 | 负载均衡策略：`ROUND_ROBIN`（默认）、`LEAST_REQUEST`、`RANDOM`、`RING_HASH` |
 
-```bash
-curl -k https://127.0.0.1:18000/rules
-curl -k https://127.0.0.1:18000/rules/{id}
-curl -k -X DELETE https://127.0.0.1:18000/rules/{id}
-```
+### BackendNode
 
-### 健康和节点
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `address` | string | 后端地址，IP 或 DNS 名称 |
+| `port` | uint32 | 后端端口 |
+| `weight` | uint32 | 权重，默认 1 |
 
-```bash
-curl -k https://127.0.0.1:18000/health
-curl -k https://127.0.0.1:18000/nodes
-curl -k https://127.0.0.1:18000/metrics
-```
+## Envoy Bootstrap
 
-`/health` 返回规则数、Envoy 连接状态、连续持久化失败次数、运行时间、HTTP 请求和错误计数。
+`envoy.yaml` 配置 Envoy 使用 Delta gRPC ADS 连接控制面：
 
-`/nodes` 只返回当前持有活跃 xDS watch 的 Envoy 节点。
+- Node ID: `envoy-local`
+- xDS 集群: `127.0.0.1:18001` (mTLS)
+- 重试策略: 1s-5s 指数退避
+- 断路器: 最大 4 连接 / 64 请求 / 32 待处理 / 8 重试
 
-`/metrics` 输出 JSON，包含 HTTP 请求计数、限流计数和 gRPC 请求计数。
+## License
 
-gRPC 指标里，`connections_total` 是累计建立的 stream 数，`active_connections` 是当前活跃 stream 数。
-
-## 认证和限流
-
-API Key 示例：
-
-```bash
-curl -k -H 'X-API-KEY: your-secret' https://127.0.0.1:18000/rules
-```
-
-不会接受 `?api_key=`，避免密钥进入 URL 日志。
-
-限流默认每个客户端 IP 每秒 20 次，突发 40 次。只有请求来源命中 `trusted_proxies` 时，限流和 IP 白名单才会使用 `X-Forwarded-For` 解析真实客户端 IP；否则只使用 `RemoteAddr`。
-
-## 持久化
-
-规则持久化到 PostgreSQL 数据库。
-
-在 `config.yaml` 中配置 `database.*`。数据库需要预先存在，首次启动会自动创建表。
-
-### 存储细节
-
-- 数据库是唯一的规则来源。HTTP API 和人工直接修改 DB 都会生效，控制面每 5 秒轮询检测变化。
-- HTTP API 事务写入规则并递增 revision，推送由后台轮询器异步完成。
-- 使用事务确保原子性：先删除再批量插入。
-- 保存前按 `id` 排序。
-- HTTP 返回成功只代表规则已进数据库，不代表 Envoy 已生效。Envoy 实际生效需要等待轮询器推送 + ACK。
-- 控制面每 5 秒检查一次数据库规则 revision；发现变化后重新加载规则、生成快照并推送给 Envoy。
-
-## 日志和排障
-
-普通日志级别由 `log_level` 控制：`DEBUG`、`INFO`、`WARN`、`ERROR`。
-
-启动时应看到：
-
-```text
-xDS 控制面就绪  gRPC=127.0.0.1:18001  HTTP=127.0.0.1:18000
-```
-
-常见问题：
-
-- `CERTIFICATE_VERIFY_FAILED: SAN matcher`：Envoy 校验的服务端证书 SAN 不匹配，检查 `envoy.yaml` 的 `match_typed_subject_alt_names`。
-- `加载 TLS 凭证失败`：先运行 `./tools/generate-certs.sh`，并检查 `config.yaml` 的证书路径。
-- `来源 IP 不允许`：当前默认只允许 `127.0.0.1` 访问管理 API。
-- API 返回 429：触发 `rate_limit`。
-- Envoy 没有代理端口：先看 `/nodes` 是否有 watch，再看规则是否创建成功。
-
-## 生产注意
-
-- 生产不要把管理 API 裸露到公网。
-- `api_addr` 绑定非 loopback 时，应设置强 `api_key`，并配置网络层访问控制。
-- 只在可信反向代理地址里配置 `trusted_proxies`。
-- 使用正式 CA 或 SPIFFE/SPIRE 签发 mTLS 证书。
-- `certs/` 默认不应提交。
+MIT

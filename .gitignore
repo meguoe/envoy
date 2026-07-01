@@ -3,4 +3,8 @@ certs/*
 docs/*
 .codegraph/*
 xds-control-plane
+xds-control-plane.pid
+logs/
 data/rules.json
+.env
+cmd
