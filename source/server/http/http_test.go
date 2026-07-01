@@ -627,15 +627,12 @@ func TestRateLimitKeyExtraction(t *testing.T) {
 // TestAuthMiddlewareEmptyKey 测试配置为空 APIKey 时认证关闭，所有请求放行。
 func TestAuthMiddlewareEmptyKey(t *testing.T) {
 	// 配置了空 APIKey → 认证关闭，所有请求放行
-	SetAuthConfig(&AuthConfig{APIKey: ""})
-	defer SetAuthConfig(nil)
-
 	called := false
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(200)
 	})
-	handler := authMiddleware(inner, nil)
+	handler := authMiddleware(inner, &AuthConfig{APIKey: ""})
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -646,13 +643,10 @@ func TestAuthMiddlewareEmptyKey(t *testing.T) {
 
 // TestAuthMiddlewareCorrectKey 测试携带正确 API 密钥时请求被放行。
 func TestAuthMiddlewareCorrectKey(t *testing.T) {
-	SetAuthConfig(&AuthConfig{APIKey: "my-secret-key"})
-	defer SetAuthConfig(nil)
-
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	handler := authMiddleware(inner, nil)
+	handler := authMiddleware(inner, &AuthConfig{APIKey: "my-secret-key"})
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.Header.Set("X-API-KEY", "my-secret-key")
 	w := httptest.NewRecorder()
@@ -664,13 +658,10 @@ func TestAuthMiddlewareCorrectKey(t *testing.T) {
 
 // TestAuthMiddlewareNoKeyHeader 测试未设置 X-API-KEY 头时返回 401 状态码。
 func TestAuthMiddlewareNoKeyHeader(t *testing.T) {
-	SetAuthConfig(&AuthConfig{APIKey: "my-secret-key"})
-	defer SetAuthConfig(nil)
-
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	handler := authMiddleware(inner, nil)
+	handler := authMiddleware(inner, &AuthConfig{APIKey: "my-secret-key"})
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	// 不设置 X-API-KEY header
 	w := httptest.NewRecorder()
@@ -682,13 +673,10 @@ func TestAuthMiddlewareNoKeyHeader(t *testing.T) {
 
 // TestAuthMiddlewareCaseSensitive 测试 API 密钥比较区分大小写。
 func TestAuthMiddlewareCaseSensitive(t *testing.T) {
-	SetAuthConfig(&AuthConfig{APIKey: "my-secret-key"})
-	defer SetAuthConfig(nil)
-
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	handler := authMiddleware(inner, nil)
+	handler := authMiddleware(inner, &AuthConfig{APIKey: "my-secret-key"})
 
 	// 不同大小写应被拒绝（ConstantTimeCompare 是字节精确比较）
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -700,52 +688,35 @@ func TestAuthMiddlewareCaseSensitive(t *testing.T) {
 	}
 }
 
-// TestAuthMiddlewareHotReload 测试认证配置热更新后旧密钥失效、新密钥生效。
-func TestAuthMiddlewareHotReload(t *testing.T) {
+// TestAuthMiddlewareHandlersAreIsolated 测试不同 handler 的认证配置互不污染。
+func TestAuthMiddlewareHandlersAreIsolated(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	handler := authMiddleware(inner, nil)
+	alphaHandler := authMiddleware(inner, &AuthConfig{APIKey: "alpha"})
+	betaHandler := authMiddleware(inner, &AuthConfig{APIKey: "beta"})
 
-	// 第一轮：key=alpha
-	SetAuthConfig(&AuthConfig{APIKey: "alpha"})
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.Header.Set("X-API-KEY", "alpha")
 	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+	alphaHandler.ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Errorf("alpha key: status = %d, want 200", w.Code)
 	}
 
-	// 热更新 key
-	SetAuthConfig(&AuthConfig{APIKey: "beta"})
-	defer SetAuthConfig(nil)
-
-	// 旧 key 应被拒绝
 	w2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req2.Header.Set("X-API-KEY", "alpha")
-	handler.ServeHTTP(w2, req2)
+	betaHandler.ServeHTTP(w2, req2)
 	if w2.Code != 401 {
-		t.Errorf("old key after reload: status = %d, want 401", w2.Code)
+		t.Errorf("alpha key on beta handler: status = %d, want 401", w2.Code)
 	}
 
-	// 新 key 应被接受
 	w3 := httptest.NewRecorder()
 	req3 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req3.Header.Set("X-API-KEY", "beta")
-	handler.ServeHTTP(w3, req3)
+	betaHandler.ServeHTTP(w3, req3)
 	if w3.Code != 200 {
-		t.Errorf("new key after reload: status = %d, want 200", w3.Code)
-	}
-}
-
-// TestSetAuthConfigNil 测试设置空认证配置后 APIKey 被清空。
-func TestSetAuthConfigNil(t *testing.T) {
-	SetAuthConfig(&AuthConfig{APIKey: "something"})
-	SetAuthConfig(nil)
-	cfg := currentAuthConfig.Load()
-	if cfg.APIKey != "" {
-		t.Errorf("after nil: APIKey = %q, want empty", cfg.APIKey)
+		t.Errorf("beta key: status = %d, want 200", w3.Code)
 	}
 }

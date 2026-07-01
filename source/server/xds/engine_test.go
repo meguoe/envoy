@@ -3,7 +3,7 @@ package xdsserver
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -12,10 +12,10 @@ import (
 // silenceLogs 在测试期间将日志输出重定向到 io.Discard，测试结束后恢复。
 func silenceLogs(t *testing.T) {
 	t.Helper()
-	old := log.Writer()
-	log.SetOutput(io.Discard)
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(func() {
-		log.SetOutput(old)
+		slog.SetDefault(old)
 	})
 }
 
@@ -144,9 +144,9 @@ func TestSetDeployedRevision(t *testing.T) {
 
 // fakePushStore 是用于单元测试的内存推送状态存储实现。
 type fakePushStore struct {
-	mu        sync.Mutex
-	deployed  []int64
-	failed    []int64
+	mu       sync.Mutex
+	deployed []int64
+	failed   []int64
 }
 
 // MarkPushDeployed 记录已部署的 revision 到内存列表。
@@ -162,6 +162,11 @@ func (s *fakePushStore) MarkPushFailed(_ context.Context, revision int64, _ stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed = append(s.failed, revision)
+	return nil
+}
+
+// MarkPushTimeout 记录超时的 revision 到内存列表。
+func (s *fakePushStore) MarkPushTimeout(_ context.Context, revision int64) error {
 	return nil
 }
 

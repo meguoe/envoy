@@ -11,6 +11,7 @@ import (
 	xdscore "github.com/cncf/xds/go/xds/core/v3"
 	matcher "github.com/cncf/xds/go/xds/type/matcher/v3"
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
@@ -44,7 +45,7 @@ func buildHTTPRule(rule *ProxyRule, connectTimeout time.Duration) (*ruleRes, err
 		lbEndpoints = append(lbEndpoints, &endpoint.LbEndpoint{
 			HostIdentifier: &endpoint.LbEndpoint_Endpoint{
 				Endpoint: &endpoint.Endpoint{
-					Address: socketAddr(b.Address, b.Port),
+					Address: makeAddress(b.Address, b.Port, 0),
 				},
 			},
 			LoadBalancingWeight: &wrapperspb.UInt32Value{Value: b.Weight},
@@ -118,7 +119,7 @@ func buildHTTPRule(rule *ProxyRule, connectTimeout time.Duration) (*ruleRes, err
 
 	li := &listener.Listener{
 		Name:    "listener_" + rule.Name,
-		Address: socketAddr(rule.ListenAddr, rule.ListenPort),
+		Address: makeAddress(rule.ListenAddr, rule.ListenPort, 0),
 		FilterChains: []*listener.FilterChain{{
 			Filters: []*listener.Filter{{
 				Name: "envoy.filters.network.http_connection_manager",
@@ -145,7 +146,7 @@ func buildUDPRule(rule *ProxyRule, connectTimeout, udpIdleTimeout time.Duration)
 		lbEndpoints = append(lbEndpoints, &endpoint.LbEndpoint{
 			HostIdentifier: &endpoint.LbEndpoint_Endpoint{
 				Endpoint: &endpoint.Endpoint{
-					Address: socketAddr(b.Address, b.Port),
+					Address: makeAddress(b.Address, b.Port, 0),
 				},
 			},
 			LoadBalancingWeight: &wrapperspb.UInt32Value{Value: b.Weight},
@@ -192,7 +193,7 @@ func buildUDPRule(rule *ProxyRule, connectTimeout, udpIdleTimeout time.Duration)
 
 	li := &listener.Listener{
 		Name:              "listener_" + rule.Name,
-		Address:           udpSocketAddr(rule.ListenAddr, rule.ListenPort),
+		Address:           makeAddress(rule.ListenAddr, rule.ListenPort, core.SocketAddress_UDP),
 		UdpListenerConfig: &listener.UdpListenerConfig{},
 		ListenerFilters: []*listener.ListenerFilter{{
 			Name: "envoy.filters.udp_listener.udp_proxy",

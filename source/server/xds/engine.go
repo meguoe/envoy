@@ -16,7 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
@@ -26,6 +26,7 @@ import (
 
 	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	server "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	grpc "google.golang.org/grpc"
 
@@ -38,11 +39,11 @@ import (
 
 // ruleRes 缓存单条规则构建好的 protobuf 资源
 type ruleRes struct {
-	generation uint64          // 构建时的 rulesGen
-	endpoint   types.Resource  // EDS
-	cluster    types.Resource  // CDS
-	route      types.Resource  // RDS
-	listener   types.Resource  // LDS
+	generation uint64         // 构建时的 rulesGen
+	endpoint   types.Resource // EDS
+	cluster    types.Resource // CDS
+	route      types.Resource // RDS
+	listener   types.Resource // LDS
 }
 
 // ValidationError 业务校验错误，区别于系统错误（如推送失败）
@@ -63,7 +64,7 @@ type Engine struct {
 	rules          map[string]*ProxyRule
 	resCache       map[string]*ruleRes // 注意: 仅在 pushMu 保护下读写, 不可并发访问
 	versionSeq     uint64
-	rulesGen       uint64   // 每次 setRulesNoPush 递增，用于检测缓存是否过期
+	rulesGen       uint64       // 每次 setRulesNoPush 递增，用于检测缓存是否过期
 	mu             sync.RWMutex // 保护 rules
 	pushMu         sync.Mutex   // 串行化「修改 + 推送」
 	connectTimeout time.Duration
@@ -78,6 +79,9 @@ type Engine struct {
 	// 冲突检测索引（在 pushMu + mu 保护下维护）
 	nameIndex map[string]string // ruleName → ruleID
 	portIndex map[string]string // "addr:port:proto" → ruleID
+
+	// 上一次快照的资源名集合，用于 diff 计算变更资源
+	prevSnapshot map[resourcev3.Type]map[string]bool
 }
 
 // NewEngine 创建 xDS 引擎
@@ -240,7 +244,7 @@ func (e *Engine) setRulesNoPush(list []*ProxyRule) {
 	seenIDs := make(map[string]struct{}, len(list))
 	for _, r := range list {
 		if err := ValidateRule(r); err != nil {
-			log.Printf("跳过非法规则 %s: %v", r.ID, err)
+			slog.Warn("跳过非法规则", "rule_id", r.ID, "error", err)
 			continue
 		}
 		cp := *r
@@ -250,23 +254,23 @@ func (e *Engine) setRulesNoPush(list []*ProxyRule) {
 		}
 		NormalizeRule(&cp)
 		if cp.ID == "" {
-			log.Printf("跳过 ID 为空的规则: %s", cp.Name)
+			slog.Warn("跳过 ID 为空的规则", "name", cp.Name)
 			continue
 		}
 		if _, ok := seenIDs[cp.ID]; ok {
-			log.Printf("跳过 ID 重复规则 %s: %s", cp.ID, cp.Name)
+			slog.Warn("跳过 ID 重复规则", "rule_id", cp.ID, "name", cp.Name)
 			continue
 		}
 		if _, ok := e.rules[cp.ID]; ok {
-			log.Printf("跳过 ID 冲突规则 %s: %s", cp.ID, cp.Name)
+			slog.Warn("跳过 ID 冲突规则", "rule_id", cp.ID, "name", cp.Name)
 			continue
 		}
 		if err := e.checkNameConflict(&cp); err != nil {
-			log.Printf("跳过名称冲突规则 %s: %v", cp.ID, err)
+			slog.Warn("跳过名称冲突规则", "rule_id", cp.ID, "error", err)
 			continue
 		}
 		if err := e.checkPortConflict(&cp); err != nil {
-			log.Printf("跳过端口冲突规则 %s: %v", cp.ID, err)
+			slog.Warn("跳过端口冲突规则", "rule_id", cp.ID, "error", err)
 			continue
 		}
 		e.rules[cp.ID] = &cp

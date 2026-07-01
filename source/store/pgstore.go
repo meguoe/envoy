@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -62,7 +61,7 @@ type PgStore struct {
 	pool *pgxpool.Pool
 }
 
-// NewPgStore 创建 PostgreSQL 存储实例，自动创建数据库（若不存在）并建立连接池。
+// NewPgStore 创建 PostgreSQL 存储实例，连接目标数据库并建立连接池。数据库须已存在。
 func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	parsedDSN, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -73,33 +72,8 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		return nil, fmt.Errorf("database.dbname 只能包含字母、数字、下划线和短横线")
 	}
 
-	// 连接 postgres 库来创建目标库
+	// 连接目标库
 	port := strconv.Itoa(int(parsedDSN.Port))
-	adminDSN := BuildPgDSN(parsedDSN.Host, port, parsedDSN.User, parsedDSN.Password, "postgres")
-
-	adminConn, err := pgx.Connect(ctx, adminDSN)
-	if err != nil {
-		return nil, fmt.Errorf("连接数据库失败: %w", err)
-	}
-	defer adminConn.Close(ctx)
-
-	if err := adminConn.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("数据库不可达: %w", err)
-	}
-
-	var exists bool
-	err = adminConn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, dbname).Scan(&exists)
-	if err != nil {
-		return nil, fmt.Errorf("检查数据库是否存在失败: %w", err)
-	}
-	if !exists {
-		if _, err := adminConn.Exec(ctx, `CREATE DATABASE `+quotePGIdentifier(dbname)); err != nil {
-			return nil, fmt.Errorf("创建数据库失败: %w", err)
-		}
-		log.Printf("已自动创建数据库 %s", dbname)
-	}
-
-	// 连接目标库（统一用小写库名）
 	targetDSN := BuildPgDSN(parsedDSN.Host, port, parsedDSN.User, parsedDSN.Password, dbname)
 	cfg, err := pgxpool.ParseConfig(targetDSN)
 	if err != nil {
@@ -344,6 +318,17 @@ func (s *PgStore) MarkPushFailed(ctx context.Context, revision int64, errMsg str
 		WHERE revision = $1`, revision, errMsg)
 	if err != nil {
 		return fmt.Errorf("标记 push failed 失败: %w", err)
+	}
+	return nil
+}
+
+// MarkPushTimeout 将指定 revision 的推送状态标记为 timeout，等待下一轮 reconcile。
+func (s *PgStore) MarkPushTimeout(ctx context.Context, revision int64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE proxy_push_log SET status = 'timeout'
+		WHERE revision = $1 AND status = 'pending'`, revision)
+	if err != nil {
+		return fmt.Errorf("标记 push timeout 失败: %w", err)
 	}
 	return nil
 }

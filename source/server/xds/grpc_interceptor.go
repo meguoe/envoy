@@ -8,7 +8,7 @@ package xdsserver
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"sort"
 	"sync"
@@ -118,7 +118,7 @@ func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 			globalGRPCMetrics.RequestsFailed.Add(1)
 		}
 
-		log.Printf("[GRPC] method=%s code=%s duration=%s", info.FullMethod, code, duration.Round(time.Millisecond))
+		slog.Info("gRPC request", "method", info.FullMethod, "code", code.String(), "duration", duration.Round(time.Millisecond).String())
 		return resp, err
 	}
 }
@@ -142,7 +142,7 @@ func StreamServerInterceptor() grpc.StreamServerInterceptor {
 			globalGRPCMetrics.RequestsFailed.Add(1)
 		}
 
-		log.Printf("[GRPC] method=%s code=%s duration=%s stream=true", info.FullMethod, code, duration.Round(time.Millisecond))
+		slog.Info("gRPC stream", "method", info.FullMethod, "code", code.String(), "duration", duration.Round(time.Millisecond).String())
 		return err
 	}
 }

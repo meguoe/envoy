@@ -1,89 +1,52 @@
 package httpserver
 
-// logger.go —— 轻量分级日志
+// logger.go —— HTTP 日志配置
 //
-// 通过 config.yaml 的 log_level 控制输出级别: DEBUG, INFO, WARN, ERROR。默认 INFO。
+// 通过标准库 log/slog 输出文本或 JSON 日志。
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"log/slog"
+	"os"
 	"strings"
-	"sync/atomic"
 )
 
-type logLevel int32
+var logLevelVar = new(slog.LevelVar)
 
-const (
-	levelDebug logLevel = iota
-	levelInfo
-	levelWarn
-	levelError
-)
-
-var currentLogLevel atomic.Int32
-
-// init 初始化日志级别为 INFO。
 func init() {
-	currentLogLevel.Store(int32(levelInfo))
+	logLevelVar.Set(slog.LevelInfo)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevelVar})))
+}
+
+// ConfigureLogging 配置 HTTP 日志级别和输出格式。
+func ConfigureLogging(level string, jsonLog bool) {
+	SetLogLevel(level)
+	opts := &slog.HandlerOptions{Level: logLevelVar}
+	if jsonLog {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, opts)))
+		return
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, opts)))
 }
 
 // SetLogLevel 设置全局日志级别，支持 DEBUG、INFO、WARN、ERROR。
 func SetLogLevel(v string) {
-	currentLogLevel.Store(int32(parseLogLevel(v)))
+	logLevelVar.Set(parseLogLevel(v))
 }
 
-// parseLogLevel 将字符串日志级别转换为 logLevel 常量，不区分大小写。
-func parseLogLevel(v string) logLevel {
+func parseLogLevel(v string) slog.Level {
 	switch strings.ToUpper(strings.TrimSpace(v)) {
 	case "DEBUG":
-		return levelDebug
+		return slog.LevelDebug
 	case "WARN", "WARNING":
-		return levelWarn
+		return slog.LevelWarn
 	case "ERROR":
-		return levelError
+		return slog.LevelError
 	default:
-		return levelInfo
+		return slog.LevelInfo
 	}
 }
 
-// logDebug 输出 DEBUG 级别日志，仅在日志级别为 DEBUG 时生效。
-func logDebug(format string, args ...any) {
-	logWithLevel(levelDebug, "DEBUG", format, args...)
-}
-
-// logInfo 输出 INFO 级别日志。
-func logInfo(format string, args ...any) {
-	logWithLevel(levelInfo, "INFO", format, args...)
-}
-
-// logWarn 输出 WARN 级别日志。
-func logWarn(format string, args ...any) {
-	logWithLevel(levelWarn, "WARN", format, args...)
-}
-
-// logError 输出 ERROR 级别日志。
-func logError(format string, args ...any) {
-	logWithLevel(levelError, "ERROR", format, args...)
-}
-
-// logWithLevel 根据日志级别过滤输出，支持普通文本和结构化 JSON 两种模式。
-func logWithLevel(level logLevel, name, format string, args ...any) {
-	if level < logLevel(currentLogLevel.Load()) {
-		return
-	}
-	msg := fmt.Sprintf(format, args...)
-	if IsStructuredLogging() {
-		switch name {
-		case "DEBUG":
-			slogDebug(msg, nil)
-		case "INFO":
-			slogInfo(msg, nil)
-		case "WARN":
-			slogWarn(msg, nil)
-		case "ERROR":
-			slogError(msg, nil)
-		}
-		return
-	}
-	log.Print("[" + name + "] " + msg)
+func logAttrs(level slog.Level, msg string, attrs ...any) {
+	slog.Log(context.Background(), level, msg, attrs...)
 }

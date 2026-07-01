@@ -2,7 +2,7 @@ package xdsserver
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -91,7 +91,7 @@ func (w *RulePushWorker) doPush() {
 	dbRev, err := w.store.LoadRevision(loadCtx)
 	cancelLoad()
 	if err != nil {
-		log.Printf("RulePushWorker 加载 revision 失败: %v", err)
+		slog.Error("RulePushWorker 加载 revision 失败", "error", err)
 		return
 	}
 
@@ -103,7 +103,7 @@ func (w *RulePushWorker) doPush() {
 			status, err := w.store.PushStatus(statusCtx, dbRev)
 			cancelStatus()
 			if err != nil {
-				log.Printf("RulePushWorker 查询 push 状态失败: %v", err)
+				slog.Error("RulePushWorker 查询 push 状态失败", "error", err)
 				return
 			}
 			if status == "deployed" || status == "" {
@@ -111,39 +111,39 @@ func (w *RulePushWorker) doPush() {
 			}
 			if status != "failed" {
 				if status == "pending" {
-					log.Printf("RulePushWorker revision %d 状态为 %s，跳过推送", dbRev, status)
+					slog.Info("RulePushWorker 跳过推送", "revision", dbRev, "status", status)
 				}
 				return
 			}
-			log.Printf("RulePushWorker 重试已失败的 revision %d", dbRev)
+			slog.Info("RulePushWorker 重试已失败的 revision", "revision", dbRev)
 		}
 
 		rulesCtx, cancelRules := context.WithTimeout(w.ctx, 5*time.Second)
 		rules, err := w.store.Load(rulesCtx)
 		cancelRules()
 		if err != nil {
-			log.Printf("RulePushWorker 加载规则失败: %v", err)
+			slog.Error("RulePushWorker 加载规则失败", "error", err)
 			return
 		}
 		pendingCtx, cancelPending := context.WithTimeout(w.ctx, 5*time.Second)
 		if err := w.store.LogPushPending(pendingCtx, dbRev); err != nil {
 			cancelPending()
-			log.Printf("RulePushWorker 记录 push pending 失败: %v", err)
+			slog.Error("RulePushWorker 记录 push pending 失败", "error", err)
 			return
 		}
 		cancelPending()
 		if err := w.engine.ReplaceRulesAndPushWithVersion(rules, dbRev); err != nil {
-			log.Printf("RulePushWorker 推送失败: %v", err)
+			slog.Error("RulePushWorker 推送失败", "revision", dbRev, "error", err)
 			_ = w.store.MarkPushFailed(w.ctx, dbRev, err.Error())
 			return
 		}
-		log.Printf("RulePushWorker 推送成功: rules=%d rev=%d", len(rules), dbRev)
+		slog.Info("RulePushWorker 推送成功", "rules", len(rules), "revision", dbRev)
 
 		reCheckCtx, cancelReCheck := context.WithTimeout(w.ctx, 5*time.Second)
 		newRev, err := w.store.LoadRevision(reCheckCtx)
 		cancelReCheck()
 		if err != nil {
-			log.Printf("RulePushWorker re-check 加载 revision 失败: %v", err)
+			slog.Error("RulePushWorker re-check 加载 revision 失败", "error", err)
 			return
 		}
 		if newRev <= dbRev {

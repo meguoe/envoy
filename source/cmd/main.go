@@ -23,7 +23,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -35,12 +34,6 @@ import (
 	"envoy-control-plane/source/store"
 
 	grpc "google.golang.org/grpc"
-)
-
-const (
-	pidFile = "xds-control-plane.pid"
-	logDir  = "logs"
-	logFile = "logs/xds-control-plane.log"
 )
 
 var (
@@ -56,166 +49,6 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// readPIDFile 从 PID 文件中读取进程 ID 并返回。
-func readPIDFile() (int, error) {
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		return 0, err
-	}
-	var pid int
-	_, err = fmt.Sscanf(string(data), "%d", &pid)
-	return pid, err
-}
-
-// isProcessRunning 通过向指定 PID 发送零号信号判断进程是否存活。
-func isProcessRunning(pid int) bool {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-// startDaemon 以守护进程方式启动服务，将标准输出和错误输出重定向到日志文件。
-func startDaemon(configPath string, structuredLog bool) {
-	pid, err := readPIDFile()
-	if err == nil && isProcessRunning(pid) {
-		fmt.Printf("服务已在运行 (PID %d)\n", pid)
-		return
-	}
-
-	args := []string{"-config", configPath}
-	if structuredLog {
-		args = append(args, "-json-log")
-	}
-
-	selfPath, err := os.Executable()
-	if err != nil {
-		selfPath = os.Args[0]
-	}
-	cmd := exec.Command(selfPath, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		fmt.Printf("创建日志目录失败: %v\n", err)
-		return
-	}
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		log.Fatalf("打开日志文件失败: %v", err)
-	}
-	cmd.Stdout = f
-	cmd.Stderr = f
-
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("启动后台进程失败: %v", err)
-	}
-	f.Close()
-
-	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644); err != nil {
-		log.Printf("写入 PID 文件失败: %v", err)
-	}
-
-	fmt.Printf("服务已启动 (PID %d)\n", cmd.Process.Pid)
-	fmt.Printf("日志文件: %s\n", logFile)
-}
-
-// stopDaemon 向运行中的服务发送 SIGTERM 信号，等待优雅退出，超时后强制终止。
-func stopDaemon() {
-	pid, err := readPIDFile()
-	if err != nil {
-		fmt.Println("服务未运行")
-		return
-	}
-	if !isProcessRunning(pid) {
-		os.Remove(pidFile)
-		fmt.Println("服务未运行")
-		return
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		fmt.Printf("查找进程失败: %v\n", err)
-		return
-	}
-
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		fmt.Printf("停止服务失败: %v\n", err)
-		return
-	}
-
-	for i := 0; i < 50; i++ {
-		if !isProcessRunning(pid) {
-			os.Remove(pidFile)
-			fmt.Printf("服务已停止 (PID %d)\n", pid)
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	process.Signal(syscall.SIGKILL)
-	os.Remove(pidFile)
-	fmt.Printf("服务已强制停止 (PID %d)\n", pid)
-}
-
-// statusDaemon 检查 PID 文件并判断服务是否正在运行，输出当前状态。
-func statusDaemon() {
-	pid, err := readPIDFile()
-	if err != nil {
-		fmt.Println("服务未运行")
-		return
-	}
-	if isProcessRunning(pid) {
-		fmt.Printf("服务运行中 (PID %d)\n", pid)
-	} else {
-		os.Remove(pidFile)
-		fmt.Println("服务未运行")
-	}
-}
-
-// restartDaemon 先停止已运行的服务，再以守护进程方式重新启动。
-func restartDaemon(configPath string, structuredLog bool) {
-	pid, err := readPIDFile()
-	if err == nil && isProcessRunning(pid) {
-		fmt.Printf("正在停止服务 (PID %d)...\n", pid)
-		process, _ := os.FindProcess(pid)
-		process.Signal(syscall.SIGTERM)
-		for i := 0; i < 50; i++ {
-			if !isProcessRunning(pid) {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		os.Remove(pidFile)
-	}
-	startDaemon(configPath, structuredLog)
-}
-
-// reloadDaemon 向运行中的服务发送 SIGHUP 信号触发配置热重载。
-func reloadDaemon() {
-	pid, err := readPIDFile()
-	if err != nil {
-		fmt.Println("服务未运行")
-		return
-	}
-	if !isProcessRunning(pid) {
-		os.Remove(pidFile)
-		fmt.Println("服务未运行")
-		return
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		fmt.Printf("查找进程失败: %v\n", err)
-		return
-	}
-	if err := process.Signal(syscall.SIGHUP); err != nil {
-		fmt.Printf("发送重载信号失败: %v\n", err)
-		return
-	}
-	fmt.Printf("已发送重载信号 (PID %d)\n", pid)
 }
 
 // initDB 连接 PostgreSQL 并初始化数据库表结构，force 为 true 时会先删除并重建数据库。
@@ -268,6 +101,7 @@ func printUsage() {
 	fmt.Println(`xds-control-plane - Envoy xDS 控制面
 
 用法:
+  xds-control-plane [选项]
   xds-control-plane <命令> [选项]
 
 命令:
@@ -279,23 +113,17 @@ func printUsage() {
   cert                生成证书（默认生成 mTLS + HTTPS）
   cert --mtls         仅生成 mTLS 证书
   cert --https        仅生成 HTTPS 证书
-  start               后台启动服务
-  restart             重启服务
-  stop                停止服务
-  reload              重新加载配置
-  status              查看运行状态
 
 选项:
   -config <path>      配置文件路径 (默认: config.yaml)
-  -json-log           启用 JSON 结构化日志
+  -json-log           启用 JSON 结构化日志输出
   --help, -h          显示此帮助信息
 
 示例:
+  xds-control-plane
   xds-control-plane setup
   xds-control-plane initdb
-  xds-control-plane cert --mtls
-  xds-control-plane cert --https
-  xds-control-plane start`)
+  xds-control-plane cert --mtls`)
 }
 
 // main 程序入口，解析命令行参数并启动 xDS 控制面服务。
@@ -322,21 +150,6 @@ func main() {
 				}
 			}
 			initDB(force)
-			return
-		case "start":
-			startDaemon(*configPath, *structuredLog)
-			return
-		case "restart":
-			restartDaemon(*configPath, *structuredLog)
-			return
-		case "stop":
-			stopDaemon()
-			return
-		case "reload":
-			reloadDaemon()
-			return
-		case "status":
-			statusDaemon()
 			return
 		case "config":
 			if len(args) > 1 && args[1] == "--init" {
@@ -439,10 +252,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
-	httpserver.SetLogLevel(cfg.Server.LogLevel)
-	if *structuredLog {
-		httpserver.EnableStructuredLogging(true)
-	}
+	httpserver.ConfigureLogging(cfg.Server.LogLevel, *structuredLog)
 
 	// 1. 初始化存储
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
@@ -515,9 +325,10 @@ func main() {
 		}
 		authCfg = &httpserver.AuthConfig{APIKey: apiKey}
 	}
+	httpAPI := httpserver.NewServer(engine, dataStore, worker, cfg.API.MaxBodyBytes, authCfg, cfg.API.RateLimit.RPS, cfg.API.RateLimit.Burst)
 	httpSrv = &http.Server{
 		Addr:              cfg.Server.APIAddr,
-		Handler:           httpserver.NewHandler(engine, dataStore, worker, cfg.API.MaxBodyBytes, authCfg, cfg.API.RateLimit.RPS, cfg.API.RateLimit.Burst),
+		Handler:           httpAPI.Handler(),
 		ReadHeaderTimeout: cfg.API.Timeout.ReadHeaderTimeout,
 		ReadTimeout:       cfg.API.Timeout.ReadTimeout,
 		WriteTimeout:      cfg.API.Timeout.WriteTimeout,
@@ -570,34 +381,7 @@ func main() {
 
 	// 7. 等待信号或服务器错误
 	quit := make(chan os.Signal, 1)
-	reload := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	signal.Notify(reload, syscall.SIGHUP)
-
-	go func() {
-		for range reload {
-			log.Println("收到 SIGHUP，重新加载配置...")
-			newCfg, err := config.Load(*configPath)
-			if err != nil {
-				log.Printf("重新加载配置失败: %v", err)
-				continue
-			}
-			cfg = newCfg
-			httpserver.SetLogLevel(cfg.Server.LogLevel)
-			// 重新加载 API 认证配置
-			if cfg.API.Auth.Enabled {
-				apiKey := os.Getenv("API_KEY")
-				if apiKey == "" {
-					log.Printf("警告: api.auth.enabled 为 true 但 API_KEY 未设置，保留旧认证配置")
-				} else {
-					httpserver.SetAuthConfig(&httpserver.AuthConfig{APIKey: apiKey})
-				}
-			} else {
-				httpserver.SetAuthConfig(nil)
-			}
-			log.Printf("配置已重新加载")
-		}
-	}()
 
 	select {
 	case sig := <-quit:
@@ -615,11 +399,11 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// 停止 HTTP handler 后台 goroutine（限流器清理等）
-	httpserver.StopHandler()
-
 	// 先停推送 worker，等待 goroutine 退出
 	worker.Stop()
+
+	// 停止 HTTP 后台 goroutine（限流器清理等）
+	httpAPI.Stop()
 
 	// HTTP 优雅关闭
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {

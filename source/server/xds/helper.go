@@ -12,8 +12,8 @@ import (
 	anypb "google.golang.org/protobuf/types/known/anypb"
 )
 
-// socketAddr 构造 TCP 协议的 Envoy SocketAddress 资源。
-func socketAddr(addr string, port uint32) *core.Address {
+// makeAddress 构造 Envoy SocketAddress 资源，protocol 为空时默认 TCP。
+func makeAddress(addr string, port uint32, protocol core.SocketAddress_Protocol) *core.Address {
 	return &core.Address{
 		Address: &core.Address_SocketAddress{
 			SocketAddress: &core.SocketAddress{
@@ -21,21 +21,7 @@ func socketAddr(addr string, port uint32) *core.Address {
 				PortSpecifier: &core.SocketAddress_PortValue{
 					PortValue: port,
 				},
-			},
-		},
-	}
-}
-
-// udpSocketAddr 构造 UDP 协议的 Envoy SocketAddress 资源。
-func udpSocketAddr(addr string, port uint32) *core.Address {
-	return &core.Address{
-		Address: &core.Address_SocketAddress{
-			SocketAddress: &core.SocketAddress{
-				Address: addr,
-				PortSpecifier: &core.SocketAddress_PortValue{
-					PortValue: port,
-				},
-				Protocol: core.SocketAddress_UDP,
+				Protocol: protocol,
 			},
 		},
 	}

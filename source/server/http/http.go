@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -27,10 +28,6 @@ const (
 
 var reqSeq uint64
 
-type requestIDProvider interface {
-	requestID() string
-}
-
 type Store interface {
 	MutateRulesAndBumpRevision(ctx context.Context, mutate func([]*xdsserver.ProxyRule) ([]*xdsserver.ProxyRule, error)) ([]*xdsserver.ProxyRule, int64, error)
 	Load(ctx context.Context) ([]*xdsserver.ProxyRule, error)
@@ -43,10 +40,11 @@ type Server struct {
 	notifier     xdsserver.RuleChangeNotifier
 	maxBodyBytes int64
 	rateLimiter  *RateLimiter
+	authCfg      *AuthConfig
 }
 
-// NewHandler 创建 HTTP API 处理器，配置路由、认证、限流和访问日志中间件。
-func NewHandler(engine *xdsserver.Engine, store Store, notifier xdsserver.RuleChangeNotifier, maxBodyBytes int64, authCfg *AuthConfig, rps, burst float64) http.Handler {
+// NewServer 创建 HTTP API Server。
+func NewServer(engine *xdsserver.Engine, store Store, notifier xdsserver.RuleChangeNotifier, maxBodyBytes int64, authCfg *AuthConfig, rps, burst float64) *Server {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = DefaultMaxBodyBytes
 	}
@@ -56,28 +54,30 @@ func NewHandler(engine *xdsserver.Engine, store Store, notifier xdsserver.RuleCh
 	if burst <= 0 {
 		burst = 40
 	}
-	SetAuthConfig(authCfg)
-	s := &Server{engine: engine, store: store, notifier: notifier, maxBodyBytes: maxBodyBytes}
-	rl := NewRateLimiter(rps, burst)
-	s.rateLimiter = rl
-	currentHandler = s
-	return logHTTP(rateLimitMiddleware(authMiddleware(s.buildMux(), nil), rl))
+	return &Server{
+		engine:       engine,
+		store:        store,
+		notifier:     notifier,
+		maxBodyBytes: maxBodyBytes,
+		rateLimiter:  NewRateLimiter(rps, burst),
+		authCfg:      authCfg,
+	}
+}
+
+// NewHandler 创建 HTTP API 处理器，配置路由、认证、限流和访问日志中间件。
+func NewHandler(engine *xdsserver.Engine, store Store, notifier xdsserver.RuleChangeNotifier, maxBodyBytes int64, authCfg *AuthConfig, rps, burst float64) http.Handler {
+	return NewServer(engine, store, notifier, maxBodyBytes, authCfg, rps, burst).Handler()
+}
+
+// Handler 返回带认证、限流和访问日志中间件的 HTTP handler。
+func (s *Server) Handler() http.Handler {
+	return logHTTP(rateLimitMiddleware(authMiddleware(s.buildMux(), s.authCfg), s.rateLimiter))
 }
 
 // Stop 停止 Server 内部的后台 goroutine（如限流器清理）
 func (s *Server) Stop() {
 	if s.rateLimiter != nil {
 		s.rateLimiter.Stop()
-	}
-}
-
-// currentHandler 保存最近创建的 Server，供 StopHandler 使用
-var currentHandler *Server
-
-// StopHandler 停止当前 HTTP handler 的后台 goroutine
-func StopHandler() {
-	if currentHandler != nil {
-		currentHandler.Stop()
 	}
 }
 
@@ -115,8 +115,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		return
 	}
 	reqID := nextReqID()
-	if p, ok := w.(requestIDProvider); ok && p.requestID() != "" {
-		reqID = p.requestID()
+	if lw, ok := w.(*accessLogResponseWriter); ok && lw.reqID != "" {
+		reqID = lw.reqID
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -238,9 +238,6 @@ func (w *accessLogResponseWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-// requestID 返回当前请求的唯一标识符。
-func (w *accessLogResponseWriter) requestID() string { return w.reqID }
-
 // logHTTP 中间件记录每个 HTTP 请求的方法、路径、状态码和耗时。
 func logHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -281,34 +278,21 @@ func logAccess(r *http.Request, reqID string, status int, duration time.Duration
 	if status >= 400 {
 		m.incErrors()
 	}
-	if IsStructuredLogging() {
-		attrs := map[string]any{
-			"request_id": reqID,
-			"method":     r.Method,
-			"path":       r.URL.Path,
-			"status":     status,
-			"duration":   duration.Round(time.Millisecond).String(),
-			"remote":     r.RemoteAddr,
-		}
-		switch {
-		case status >= 500:
-			slogError("request", attrs)
-		case status >= 400:
-			slogWarn("request", attrs)
-		default:
-			slogInfo("request", attrs)
-		}
-		return
+	attrs := []any{
+		"request_id", reqID,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", status,
+		"duration", duration.Round(time.Millisecond).String(),
+		"remote", r.RemoteAddr,
 	}
-	format := "request_id=%s method=%s path=%s status=%d duration=%s remote=%s"
-	args := []any{reqID, r.Method, r.URL.Path, status, duration.Round(time.Millisecond), r.RemoteAddr}
 	switch {
 	case status >= 500:
-		logError(format, args...)
+		logAttrs(slog.LevelError, "request", attrs...)
 	case status >= 400:
-		logWarn(format, args...)
+		logAttrs(slog.LevelWarn, "request", attrs...)
 	default:
-		logInfo(format, args...)
+		logAttrs(slog.LevelInfo, "request", attrs...)
 	}
 }
 

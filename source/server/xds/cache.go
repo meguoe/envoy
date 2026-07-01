@@ -8,7 +8,7 @@ package xdsserver
 // 不可并发访问。
 
 import (
-	"log"
+	"log/slog"
 	"time"
 
 	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -31,7 +31,7 @@ func (e *Engine) syncResCache(current map[string]*ProxyRule, connectTimeout, udp
 		if !ok || cached.generation != gen {
 			res, err := buildOneRule(rule, connectTimeout, udpIdleTimeout)
 			if err != nil {
-				log.Printf("构建资源失败 name=%s: %v", name, err)
+				slog.Error("构建资源失败", "name", name, "error", err)
 				failed = append(failed, name)
 				delete(e.resCache, name)
 				continue
