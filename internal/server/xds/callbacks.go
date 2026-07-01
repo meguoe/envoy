@@ -253,3 +253,19 @@ func (c *AckCallbacks) finishRevisionLocked(revision int64) {
 		}
 	}
 }
+
+// MarkRevisionDeployed 直接标记 revision 为 deployed（用于空快照等无需 ACK 的场景）
+func (c *AckCallbacks) MarkRevisionDeployed(revision int64) {
+	c.mu.Lock()
+	c.finishRevisionLocked(revision)
+	c.mu.Unlock()
+
+	if c.store != nil {
+		if err := c.store.MarkPushDeployed(context.Background(), revision); err != nil {
+			log.Printf("标记 deployed 失败: %v", err)
+		}
+	}
+	if c.onDeployed != nil {
+		c.onDeployed(revision)
+	}
+}

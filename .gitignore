@@ -1,5 +1,6 @@
 .DS_Store
 certs/*
+docs/*
 .codegraph/*
 xds-control-plane
 data/rules.json

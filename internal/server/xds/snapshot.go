@@ -5,6 +5,9 @@ package xdsserver
 // Delta xDS 模式下，快照缓存通过 ConstructVersionMap() 构建
 // 每个资源的哈希版本映射，自动比对并只推送变更的资源，
 // 控制面无需再维护全局内容哈希做去重。
+//
+// 快照推送由后台轮询器触发：DB revision 变化 → 加载全量规则 → 构建快照 → 写入 SnapshotCache。
+// Envoy ACK 全部 typeURL 后该 revision 标记为 deployed。
 
 import (
 	"context"
@@ -29,7 +32,7 @@ func (e *Engine) pushSnapshotLocked() error {
 
 // pushSnapshotLockedWithVersion 构建快照并推送到 Envoy，使用指定版本号
 func (e *Engine) pushSnapshotLockedWithVersion(version string) error {
-	// 在 pushMu 保护下取快照，此时不会有其他 CRUD 操作修改 rules
+	// 在 pushMu 保护下取快照，此时不会有其他操作修改 rules
 	e.mu.RLock()
 	snapshot := make(map[string]*ProxyRule, len(e.rules))
 	for name, r := range e.rules {
@@ -67,12 +70,17 @@ func (e *Engine) pushSnapshotLockedWithVersion(version string) error {
 		resources[resourcev3.ListenerType] = lis
 	}
 
-	if tracker, ok := e.callbacks.(interface {
-		TrackExpected(int64, []string)
-	}); ok {
-		var revision int64
-		if _, err := fmt.Sscanf(version, "%d", &revision); err == nil {
-			tracker.TrackExpected(revision, expectedTypeURLs(resources))
+	expectedURLs := expectedTypeURLs(resources)
+
+	// 非空 snapshot：先 TrackExpected 再 SetSnapshot，避免 ACK 先到但 expected 为空的竞态
+	if len(expectedURLs) > 0 {
+		if tracker, ok := e.callbacks.(interface {
+			TrackExpected(int64, []string)
+		}); ok {
+			var revision int64
+			if _, err := fmt.Sscanf(version, "%d", &revision); err == nil {
+				tracker.TrackExpected(revision, expectedURLs)
+			}
 		}
 	}
 
@@ -86,6 +94,19 @@ func (e *Engine) pushSnapshotLockedWithVersion(version string) error {
 	}
 	if err := e.snapCache.SetSnapshot(context.Background(), e.nodeID, snap); err != nil {
 		return fmt.Errorf("设置快照失败: %w", err)
+	}
+
+	// 空 snapshot（如删除所有规则后）没有资源需要 ACK，SetSnapshot 成功后直接标记 deployed
+	if len(expectedURLs) == 0 {
+		var revision int64
+		if _, err := fmt.Sscanf(version, "%d", &revision); err == nil {
+			log.Printf("空快照推送  ver=%s  直接标记 deployed", version)
+			if tracker, ok := e.callbacks.(interface {
+				MarkRevisionDeployed(int64)
+			}); ok {
+				tracker.MarkRevisionDeployed(revision)
+			}
+		}
 	}
 
 	if len(names) > 0 {

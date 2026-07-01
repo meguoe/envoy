@@ -2,13 +2,14 @@ package xdsserver
 
 // engine.go —— xDS 引擎，对外接口
 //
-// Engine 封装了所有 xDS 状态，外部通过 Engine 方法操作规则
-// 内部自动管理：增量缓存、快照推送、失败回滚
+// Engine 封装了所有 xDS 状态，外部通过 Engine 方法操作规则。
+// 内部自动管理：增量缓存、快照推送。
+// 规则持久化由 PostgreSQL 负责，引擎只负责规则加载和 xDS 快照推送。
 //
 // 锁策略：
 //   - mu        保护 rules map 的读写
 //   - pushMu    串行化「规则修改 + 快照推送」，保证原子性
-//   - CRUD 方法在 pushMu 内先修改 rules，再推送快照，失败则回滚
+//   - ReplaceRulesAndPush* 方法在 pushMu 内先修改 rules，再推送快照，失败则恢复旧规则
 //   - ListRules / GetRule 只读，不持有 pushMu，可以与推送并发
 
 import (

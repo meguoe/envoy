@@ -1,8 +1,10 @@
 package xdsserver
 
 import (
+	"context"
 	"io"
 	"log"
+	"sync"
 	"testing"
 	"time"
 )
@@ -127,5 +129,64 @@ func TestSetDeployedRevision(t *testing.T) {
 	e.SetDeployedRevision(5)
 	if got := e.LastDeployedRevision(); got != 5 {
 		t.Errorf("LastDeployedRevision = %d, want 5", got)
+	}
+}
+
+type fakePushStore struct {
+	mu        sync.Mutex
+	deployed  []int64
+	failed    []int64
+}
+
+func (s *fakePushStore) MarkPushDeployed(_ context.Context, revision int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deployed = append(s.deployed, revision)
+	return nil
+}
+
+func (s *fakePushStore) MarkPushFailed(_ context.Context, revision int64, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failed = append(s.failed, revision)
+	return nil
+}
+
+func (s *fakePushStore) getDeployed() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int64, len(s.deployed))
+	copy(out, s.deployed)
+	return out
+}
+
+func TestEmptySnapshotMarksDeployed(t *testing.T) {
+	silenceLogs(t)
+
+	store := &fakePushStore{}
+	e := NewEngine("test", time.Second, 60*time.Second)
+	ackCb := NewAckCallbacks(store, func(rev int64) {
+		e.SetDeployedRevision(rev)
+	})
+	e.SetCallbacks(ackCb)
+
+	// 先加载一条规则，再用空列表替换，触发空 snapshot
+	e.SetRules([]*ProxyRule{{
+		ID: "r1", Name: "r1", Protocol: "http",
+		ListenAddr: "0.0.0.0", ListenPort: 9981,
+		Backends: []BackendNode{{Address: "127.0.0.1", Port: 8080}},
+		LBPolicy: "ROUND_ROBIN",
+	}})
+
+	if err := e.ReplaceRulesAndPushWithVersion(nil, 99); err != nil {
+		t.Fatalf("ReplaceRulesAndPushWithVersion(nil): %v", err)
+	}
+
+	deployed := store.getDeployed()
+	if len(deployed) != 1 || deployed[0] != 99 {
+		t.Errorf("MarkPushDeployed called with %v, want [99]", deployed)
+	}
+	if got := e.LastDeployedRevision(); got != 99 {
+		t.Errorf("LastDeployedRevision = %d, want 99", got)
 	}
 }

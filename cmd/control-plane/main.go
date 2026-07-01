@@ -149,6 +149,11 @@ func main() {
 	}
 
 	// 6. 推送初始快照
+	if currentRev > 0 {
+		if err := dataStore.LogPushPending(context.Background(), currentRev); err != nil {
+			log.Printf("记录初始 push pending 失败: %v", err)
+		}
+	}
 	if err := engine.ReplaceRulesAndPushWithVersion(rules, currentRev); err != nil {
 		log.Printf("初始快照推送失败: %v", err)
 	}
@@ -212,16 +217,14 @@ func startRulePoller(dataStore *store.PgStore, engine *xdsserver.Engine, interva
 				}
 				engineRev := engine.KnownRevision()
 				if dbRev == engineRev {
-					continue
-				}
-
-				// 检查是否已 failed 且 revision 未变化
-				statusCtx, cancelStatus := context.WithTimeout(ctx, 5*time.Second)
-				status, err := dataStore.PushStatus(statusCtx, dbRev)
-				cancelStatus()
-				if err == nil && status == "failed" {
-					log.Printf("规则轮询跳过已失败的 revision %d", dbRev)
-					continue
+					// 同一 revision 已推送过，检查是否 failed 允许重试
+					statusCtx, cancelStatus := context.WithTimeout(ctx, 5*time.Second)
+					status, err := dataStore.PushStatus(statusCtx, dbRev)
+					cancelStatus()
+					if err != nil || status != "failed" {
+						continue
+					}
+					log.Printf("规则轮询重试已失败的 revision %d", dbRev)
 				}
 
 				rulesCtx, cancelRules := context.WithTimeout(ctx, 5*time.Second)

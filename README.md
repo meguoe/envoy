@@ -248,9 +248,10 @@ curl -k -H 'X-API-KEY: your-secret' https://127.0.0.1:18000/rules
 ### 存储细节
 
 - 数据库是唯一的规则来源。HTTP API 和人工直接修改 DB 都会生效，控制面每 5 秒轮询检测变化。
+- HTTP API 事务写入规则并递增 revision，推送由后台轮询器异步完成。
 - 使用事务确保原子性：先删除再批量插入。
 - 保存前按 `id` 排序。
-- CRUD 推送 xDS 成功后再持久化；持久化失败不回滚已推送配置，会在 `/health.data.persist_failures` 体现。
+- HTTP 返回成功只代表规则已进数据库，不代表 Envoy 已生效。Envoy 实际生效需要等待轮询器推送 + ACK。
 - 控制面每 5 秒检查一次数据库规则 revision；发现变化后重新加载规则、生成快照并推送给 Envoy。
 
 ## 日志和排障
