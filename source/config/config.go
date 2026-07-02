@@ -116,7 +116,7 @@ func (c Config) validate() error {
 	}
 	level := strings.ToUpper(strings.TrimSpace(c.Server.LogLevel))
 	if !validLogLevels[level] {
-		return fmt.Errorf("server.log_level 无效，可选值: DEBUG, INFO, WARN, ERROR")
+		return fmt.Errorf("server.log_level 无效 %q，可选值: DEBUG, INFO, WARN, ERROR", c.Server.LogLevel)
 	}
 	if c.API.Timeout.ReadHeaderTimeout < 0 {
 		return fmt.Errorf("api.timeout.read_header_timeout 不能为负数")
@@ -205,11 +205,10 @@ func validateListenAddr(addr, field string) error {
 
 // validateFile 检查指定路径的文件是否存在且可读。
 func validateFile(path, field string) error {
-	f, err := os.Open(path)
+	_, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("%s 文件不可读 %q: %w", field, path, err)
 	}
-	f.Close()
 	return nil
 }
 

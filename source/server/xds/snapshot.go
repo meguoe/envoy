@@ -10,21 +10,23 @@ package xdsserver
 // 推送后按实际资源动态确定期望 ACK 集合，超时未齐标记 timeout。
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"sync/atomic"
 
-	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
-
 	types "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 )
+
+var orderedSnapshotTypes = []resourcev3.Type{
+	resourcev3.ListenerType,
+	resourcev3.ClusterType,
+	resourcev3.EndpointType,
+	resourcev3.RouteType,
+}
 
 // pushSnapshotLocked 构建快照并推送到 Envoy
 // 调用方必须持有 e.pushMu，保证规则修改与推送的原子性
@@ -81,20 +83,20 @@ func (e *Engine) pushSnapshotLockedWithVersion(version string) error {
 	if err := snap.ConstructVersionMap(); err != nil {
 		return fmt.Errorf("构建版本映射失败: %w", err)
 	}
-	if err := e.snapCache.SetSnapshot(context.Background(), e.nodeID, snap); err != nil {
+	if err := e.snapCache.SetSnapshot(e.ctx, e.nodeID, snap); err != nil {
 		return fmt.Errorf("设置快照失败: %w", err)
 	}
 
-	// 与上一次快照 diff，计算本次变更的资源名集合
-	currSnapshot := snapshotResourceNames(resources)
+	// 与上一次快照 diff，计算本次变更的资源集合。
+	currSnapshot := snapshotResourceVersions(snap)
 	changedResources := diffSnapshots(e.prevSnapshot, currSnapshot)
 	e.prevSnapshot = currSnapshot
 
 	// 从变更资源中提取期望 ACK 的 typeURL 集合
-	expectedURLs := expectedTypeURLsFromDiff(changedResources, resources)
+	expectedURLs := expectedTypeURLsFromDiff(changedResources)
 
-	if len(names) == 0 {
-		slog.Info("空快照推送，直接标记 deployed", "version", version)
+	if len(expectedURLs) == 0 {
+		slog.Info("快照无资源变更，直接标记 deployed", "version", version)
 		if tracker, ok := e.callbacks.(interface {
 			MarkRevisionDeployed(int64)
 		}); ok {
@@ -122,30 +124,25 @@ func (e *Engine) pushSnapshotLockedWithVersion(version string) error {
 	return nil
 }
 
-// snapshotResourceNames 提取快照中每个 typeURL 的资源名集合。
-func snapshotResourceNames(resources map[resourcev3.Type][]types.Resource) map[resourcev3.Type]map[string]bool {
-	names := make(map[resourcev3.Type]map[string]bool, len(resources))
-	for typeURL, list := range resources {
-		set := make(map[string]bool, len(list))
-		for _, r := range list {
-			var name string
-			switch v := r.(type) {
-			case *listener.Listener:
-				name = v.GetName()
-			case *cluster.Cluster:
-				name = v.GetName()
-			default:
-				continue
-			}
-			set[name] = true
+// snapshotResourceVersions 提取 Delta xDS 实际使用的资源版本图。
+func snapshotResourceVersions(snap *cache.Snapshot) map[resourcev3.Type]map[string]string {
+	versions := make(map[resourcev3.Type]map[string]string)
+	for _, typeURL := range orderedSnapshotTypes {
+		versionMap := snap.GetVersionMap(string(typeURL))
+		if len(versionMap) == 0 {
+			continue
 		}
-		names[typeURL] = set
+		cp := make(map[string]string, len(versionMap))
+		for name, version := range versionMap {
+			cp[name] = version
+		}
+		versions[typeURL] = cp
 	}
-	return names
+	return versions
 }
 
-// diffSnapshots 对比新旧快照，返回变更的资源名集合（新增 + 删除）。
-func diffSnapshots(prev, curr map[resourcev3.Type]map[string]bool) map[resourcev3.Type]map[string]bool {
+// diffSnapshots 对比新旧快照，返回变更的资源名集合（新增 + 更新 + 删除）。
+func diffSnapshots(prev, curr map[resourcev3.Type]map[string]string) map[resourcev3.Type]map[string]bool {
 	changed := make(map[resourcev3.Type]map[string]bool)
 
 	// 合并所有 typeURL
@@ -161,21 +158,21 @@ func diffSnapshots(prev, curr map[resourcev3.Type]map[string]bool) map[resourcev
 		oldSet := prev[typeURL]
 		newSet := curr[typeURL]
 		if oldSet == nil {
-			oldSet = make(map[string]bool)
+			oldSet = make(map[string]string)
 		}
 		if newSet == nil {
-			newSet = make(map[string]bool)
+			newSet = make(map[string]string)
 		}
 		diff := make(map[string]bool)
-		// 新增的资源
-		for name := range newSet {
-			if !oldSet[name] {
+		// 新增或内容更新的资源
+		for name, version := range newSet {
+			if oldSet[name] != version {
 				diff[name] = true
 			}
 		}
 		// 删除的资源
 		for name := range oldSet {
-			if !newSet[name] {
+			if _, ok := newSet[name]; !ok {
 				diff[name] = true
 			}
 		}
@@ -186,70 +183,14 @@ func diffSnapshots(prev, curr map[resourcev3.Type]map[string]bool) map[resourcev
 	return changed
 }
 
-// expectedTypeURLsFromDiff 从变更资源集合中提取期望 ACK 的 typeURL 集合，
-// 只包含有实际变更的 typeURL，再根据资源内容判断 EDS/RDS 是否需要。
-func expectedTypeURLsFromDiff(changed map[resourcev3.Type]map[string]bool, resources map[resourcev3.Type][]types.Resource) []string {
+// expectedTypeURLsFromDiff 从变更资源集合中提取期望 ACK 的 typeURL 集合。
+func expectedTypeURLsFromDiff(changed map[resourcev3.Type]map[string]bool) []string {
 	var typeURLs []string
-
-	// LDS：有 Listener 变更时等待
-	if changed[resourcev3.ListenerType] != nil {
-		typeURLs = append(typeURLs, string(resourcev3.ListenerType))
-	}
-
-	// CDS + EDS：有 Cluster 变更时等待，检查变更的 Cluster 是否需要 EDS
-	if changed[resourcev3.ClusterType] != nil {
-		typeURLs = append(typeURLs, string(resourcev3.ClusterType))
-		needEDS := false
-		for _, r := range resources[resourcev3.ClusterType] {
-			cl, ok := r.(*cluster.Cluster)
-			if !ok || !changed[resourcev3.ClusterType][cl.GetName()] {
-				continue
-			}
-			if _, isEDS := cl.ClusterDiscoveryType.(*cluster.Cluster_Type); isEDS && cl.GetType() == cluster.Cluster_EDS {
-				needEDS = true
-				break
-			}
-		}
-		if needEDS {
-			typeURLs = append(typeURLs, string(resourcev3.EndpointType))
+	for _, typeURL := range orderedSnapshotTypes {
+		if changed[typeURL] != nil {
+			typeURLs = append(typeURLs, string(typeURL))
 		}
 	}
-
-	// RDS：有 Listener 变更时，检查变更的 Listener 是否使用 HCM + RDS
-	if changed[resourcev3.ListenerType] != nil {
-		needRDS := false
-		for _, r := range resources[resourcev3.ListenerType] {
-			l, ok := r.(*listener.Listener)
-			if !ok || !changed[resourcev3.ListenerType][l.GetName()] {
-				continue
-			}
-			for _, fc := range l.GetFilterChains() {
-				for _, f := range fc.GetFilters() {
-					if f.GetName() != "envoy.filters.network.http_connection_manager" {
-						continue
-					}
-					hcmCfg := &hcm.HttpConnectionManager{}
-					if err := f.GetTypedConfig().UnmarshalTo(hcmCfg); err != nil {
-						continue
-					}
-					if _, ok := hcmCfg.GetRouteSpecifier().(*hcm.HttpConnectionManager_Rds); ok {
-						needRDS = true
-						break
-					}
-				}
-				if needRDS {
-					break
-				}
-			}
-			if needRDS {
-				break
-			}
-		}
-		if needRDS {
-			typeURLs = append(typeURLs, string(resourcev3.RouteType))
-		}
-	}
-
 	return typeURLs
 }
 

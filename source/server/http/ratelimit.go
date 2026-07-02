@@ -9,7 +9,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -129,10 +128,7 @@ func rateLimitMiddleware(next http.Handler, rl *RateLimiter) http.Handler {
 func rateLimitKey(r *http.Request) string {
 	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		clientIP = r.RemoteAddr
+		return r.RemoteAddr
 	}
-	if clientIP != "" {
-		return clientIP
-	}
-	return strings.TrimSpace(r.RemoteAddr)
+	return clientIP
 }

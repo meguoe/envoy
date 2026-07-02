@@ -80,8 +80,8 @@ type Engine struct {
 	nameIndex map[string]string // ruleName → ruleID
 	portIndex map[string]string // "addr:port:proto" → ruleID
 
-	// 上一次快照的资源名集合，用于 diff 计算变更资源
-	prevSnapshot map[resourcev3.Type]map[string]bool
+	// 上一次快照的资源版本图，用于 diff 计算变更资源。
+	prevSnapshot map[resourcev3.Type]map[string]string
 }
 
 // NewEngine 创建 xDS 引擎

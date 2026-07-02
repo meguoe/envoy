@@ -114,12 +114,12 @@ func ValidateRule(rule *ProxyRule) error {
 	}
 
 	protocol := strings.ToLower(rule.Protocol)
-	if rule.Protocol != "" && !validProtocols[protocol] {
+	if protocol != "" && !validProtocols[protocol] {
 		return &ValidationError{Msg: "protocol 无效，可选值: http, udp"}
 	}
 
 	lbPolicy := strings.ToUpper(rule.LBPolicy)
-	if rule.LBPolicy != "" && !validLBPolicies[lbPolicy] {
+	if lbPolicy != "" && !validLBPolicies[lbPolicy] {
 		return &ValidationError{Msg: "lb_policy 无效，可选值: ROUND_ROBIN, LEAST_REQUEST, RANDOM, RING_HASH"}
 	}
 

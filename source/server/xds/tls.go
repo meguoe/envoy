@@ -32,6 +32,10 @@ func (c *TLSConfig) ServerCredentials() (grpcCreds.TransportCredentials, error) 
 
 // serverTLSConfig 构建 gRPC 服务器的 mTLS 配置，包含证书加载和客户端 URI 校验。
 func (c *TLSConfig) serverTLSConfig() (*tls.Config, error) {
+	if c.ClientURI == "" {
+		return nil, fmt.Errorf("xds.tls.client_uri 不能为空，mTLS 需要配置客户端 URI SAN")
+	}
+
 	cert, err := tls.LoadX509KeyPair(c.ServerCert, c.ServerKey)
 	if err != nil {
 		return nil, fmt.Errorf("加载服务器证书失败: %w", err)

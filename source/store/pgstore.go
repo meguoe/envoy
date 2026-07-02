@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -108,6 +109,10 @@ func (s *PgStore) InitDB(ctx context.Context) error {
 
 // DropDB 终止所有连接并删除指定名称的数据库。
 func (s *PgStore) DropDB(ctx context.Context, dbName string) error {
+	if !validDatabaseName(dbName) {
+		return fmt.Errorf("数据库名 %q 不合法，只能包含字母、数字、下划线和短横线", dbName)
+	}
+
 	// 终止所有连接
 	_, _ = s.pool.Exec(ctx,
 		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
@@ -126,20 +131,14 @@ func (s *PgStore) Close() {
 
 // LoadOne 根据 ID 查询单条规则，不存在时返回 nil 而非错误。
 func (s *PgStore) LoadOne(ctx context.Context, id string) (*xdsserver.ProxyRule, error) {
-	r := &xdsserver.ProxyRule{}
-	var backendsJSON []byte
-	err := s.pool.QueryRow(ctx,
+	r, err := scanRule(s.pool.QueryRow(ctx,
 		`SELECT id, name, protocol, listen_addr, listen_port, backends, lb_policy
-		 FROM proxy_rules WHERE id = $1`, id).
-		Scan(&r.ID, &r.Name, &r.Protocol, &r.ListenAddr, &r.ListenPort, &backendsJSON, &r.LBPolicy)
+		 FROM proxy_rules WHERE id = $1`, id))
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("查询规则失败: %w", err)
-	}
-	if err := json.Unmarshal(backendsJSON, &r.Backends); err != nil {
-		return nil, fmt.Errorf("解析规则 %s backends 失败: %w", r.ID, err)
 	}
 	return r, nil
 }
@@ -156,13 +155,9 @@ func (s *PgStore) Load(ctx context.Context) ([]*xdsserver.ProxyRule, error) {
 
 	var rules []*xdsserver.ProxyRule
 	for rows.Next() {
-		r := &xdsserver.ProxyRule{}
-		var backendsJSON []byte
-		if err := rows.Scan(&r.ID, &r.Name, &r.Protocol, &r.ListenAddr, &r.ListenPort, &backendsJSON, &r.LBPolicy); err != nil {
-			return nil, fmt.Errorf("读取规则失败: %w", err)
-		}
-		if err := json.Unmarshal(backendsJSON, &r.Backends); err != nil {
-			return nil, fmt.Errorf("解析规则 %s backends 失败: %w", r.ID, err)
+		r, err := scanRule(rows)
+		if err != nil {
+			return nil, err
 		}
 		rules = append(rules, r)
 	}
@@ -233,13 +228,9 @@ func loadRulesTx(ctx context.Context, tx pgx.Tx) ([]*xdsserver.ProxyRule, error)
 
 	var rules []*xdsserver.ProxyRule
 	for rows.Next() {
-		r := &xdsserver.ProxyRule{}
-		var backendsJSON []byte
-		if err := rows.Scan(&r.ID, &r.Name, &r.Protocol, &r.ListenAddr, &r.ListenPort, &backendsJSON, &r.LBPolicy); err != nil {
-			return nil, fmt.Errorf("读取规则失败: %w", err)
-		}
-		if err := json.Unmarshal(backendsJSON, &r.Backends); err != nil {
-			return nil, fmt.Errorf("解析规则 %s backends 失败: %w", r.ID, err)
+		r, err := scanRule(rows)
+		if err != nil {
+			return nil, err
 		}
 		rules = append(rules, r)
 	}
@@ -247,6 +238,23 @@ func loadRulesTx(ctx context.Context, tx pgx.Tx) ([]*xdsserver.ProxyRule, error)
 		return nil, fmt.Errorf("读取规则失败: %w", err)
 	}
 	return rules, nil
+}
+
+// scanRule 从 pgx.Row 或 pgx.Rows 中扫描一条规则并反序列化 backends。
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRule(scanner rowScanner) (*xdsserver.ProxyRule, error) {
+	r := &xdsserver.ProxyRule{}
+	var backendsJSON []byte
+	if err := scanner.Scan(&r.ID, &r.Name, &r.Protocol, &r.ListenAddr, &r.ListenPort, &backendsJSON, &r.LBPolicy); err != nil {
+		return nil, fmt.Errorf("读取规则失败: %w", err)
+	}
+	if err := json.Unmarshal(backendsJSON, &r.Backends); err != nil {
+		return nil, fmt.Errorf("解析规则 %s backends 失败: %w", r.ID, err)
+	}
+	return r, nil
 }
 
 // replaceRulesTx 在事务中对比新旧规则列表，执行删除和 UPSERT 操作。

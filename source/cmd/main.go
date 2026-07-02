@@ -172,7 +172,7 @@ func main() {
 			fmt.Println("用法: config --init | config --validate")
 			return
 		case "cert":
-			cfg, err := config.Load(*configPath)
+			certCfg, err := config.Load(*configPath)
 			if err != nil {
 				fmt.Printf("加载配置失败: %v\n", err)
 				return
@@ -191,13 +191,13 @@ func main() {
 				certDir := "certs/" + certType
 				var clientURI string
 				if certType == "mtls" {
-					if cfg.XDS.TLS.Enabled && cfg.XDS.TLS.CACert != "" {
-						certDir = filepath.Dir(cfg.XDS.TLS.CACert)
+					if certCfg.XDS.TLS.Enabled && certCfg.XDS.TLS.CACert != "" {
+						certDir = filepath.Dir(certCfg.XDS.TLS.CACert)
 					}
-					clientURI = cfg.XDS.TLS.ClientURI
+					clientURI = certCfg.XDS.TLS.ClientURI
 				} else {
-					if cfg.API.TLS.Enabled && cfg.API.TLS.CertFile != "" {
-						certDir = filepath.Dir(cfg.API.TLS.CertFile)
+					if certCfg.API.TLS.Enabled && certCfg.API.TLS.CertFile != "" {
+						certDir = filepath.Dir(certCfg.API.TLS.CertFile)
 					}
 				}
 				if err := config.GenerateCerts(config.CertConfig{

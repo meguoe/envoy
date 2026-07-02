@@ -110,9 +110,7 @@ func (w *RulePushWorker) doPush() {
 				return
 			}
 			if status != "failed" {
-				if status == "pending" {
-					slog.Info("RulePushWorker 跳过推送", "revision", dbRev, "status", status)
-				}
+				slog.Debug("RulePushWorker 跳过推送", "revision", dbRev, "status", status)
 				return
 			}
 			slog.Info("RulePushWorker 重试已失败的 revision", "revision", dbRev)
@@ -134,7 +132,7 @@ func (w *RulePushWorker) doPush() {
 		cancelPending()
 		if err := w.engine.ReplaceRulesAndPushWithVersion(rules, dbRev); err != nil {
 			slog.Error("RulePushWorker 推送失败", "revision", dbRev, "error", err)
-			_ = w.store.MarkPushFailed(w.ctx, dbRev, err.Error())
+			_ = w.store.MarkPushFailed(context.Background(), dbRev, err.Error())
 			return
 		}
 		slog.Info("RulePushWorker 推送成功", "rules", len(rules), "revision", dbRev)

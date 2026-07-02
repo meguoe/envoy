@@ -34,7 +34,7 @@ type pendingNonce struct {
 }
 
 type revisionState struct {
-	expected map[string]bool // 本次推送期望被 ACK 的 typeURL 雅合
+	expected map[string]bool // 本次推送期望被 ACK 的 typeURL 集合
 	acked    map[string]bool // 已 ACK 的 typeURL
 }
 

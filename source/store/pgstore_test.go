@@ -3,38 +3,123 @@ package store
 import (
 	"context"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/joho/godotenv"
 
 	xdsserver "envoy-control-plane/source/server/xds"
 )
 
+const testDBName = "dev_test"
+
+func TestMain(m *testing.M) {
+	godotenv.Load("../../.env")
+	os.Exit(m.Run())
+}
+
 // testDSN 为测试环境构造数据库 DSN 字符串。
-//
-// 根据传入的数据库名称生成连接字符串，仅用于单元测试或集成测试环境。
-// 假设数据库运行在本地，并使用测试环境默认的连接配置。
+// 复用应用的环境变量（DB_HOST、DB_PORT、DB_USER、DB_PASSWORD）。
 func testDSN(t *testing.T, dbname string) string {
 	t.Helper()
-	host := os.Getenv("PG_HOST")
+	host := os.Getenv("DB_HOST")
 	if host == "" {
 		host = "localhost"
 	}
-	port := os.Getenv("PG_PORT")
+	port := os.Getenv("DB_PORT")
 	if port == "" {
 		port = "5432"
 	}
-	user := os.Getenv("PG_USER")
+	user := os.Getenv("DB_USER")
 	if user == "" {
-		t.Skip("PG_USER not set, skipping integration test")
+		user = "postgres"
 	}
-	pass := os.Getenv("PG_PASSWORD")
-	if pass == "" {
-		t.Skip("PG_PASSWORD not set, skipping integration test")
-	}
+	pass := os.Getenv("DB_PASSWORD")
 	return BuildPgDSN(host, port, user, pass, dbname)
+}
+
+// dropTestDB 终止指定数据库的所有连接并删除。
+func dropTestDB(t *testing.T, dbname string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, testDSN(t, "postgres"))
+	if err != nil {
+		t.Logf("dropTestDB: 连接 postgres 失败: %v", err)
+		return
+	}
+	defer conn.Close(ctx)
+
+	tag, _ := conn.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, dbname)
+	t.Logf("dropTestDB: terminated %s for %s", tag, dbname)
+	time.Sleep(300 * time.Millisecond)
+
+	tag, err = conn.Exec(ctx, `DROP DATABASE IF EXISTS `+quotePGIdentifier(dbname))
+	if err != nil {
+		t.Logf("dropTestDB: DROP %s 失败: %v", dbname, err)
+	} else {
+		t.Logf("dropTestDB: %s %s", tag, dbname)
+	}
+}
+
+// resetTestTables 清空所有表数据并重置 revision 为 0。
+func resetTestTables(t *testing.T, store *PgStore) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := store.pool.Exec(ctx, `TRUNCATE proxy_rules, proxy_push_log RESTART IDENTITY`); err != nil {
+		t.Fatalf("TRUNCATE 失败: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE revision_counter SET current_revision = 0 WHERE id = 1`); err != nil {
+		t.Fatalf("重置 revision 失败: %v", err)
+	}
+}
+
+// newTestStore 创建用于集成测试的 PgStore 实例，使用共享测试库。
+// 每次调用会清空表数据，测试结束后自动删除数据库。
+func newTestStore(t *testing.T) *PgStore {
+	t.Helper()
+
+	// 清理可能残留的旧库
+	dropTestDB(t, testDBName)
+
+	// 连接 postgres 管理库，创建测试库
+	adminDSN := testDSN(t, "postgres")
+	adminCtx, adminCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer adminCancel()
+	adminConn, err := pgx.Connect(adminCtx, adminDSN)
+	if err != nil {
+		t.Fatalf("连接 postgres 失败: %v", err)
+	}
+	defer adminConn.Close(adminCtx)
+
+	if _, err := adminConn.Exec(adminCtx, `CREATE DATABASE `+quotePGIdentifier(testDBName)); err != nil {
+		t.Fatalf("创建测试库 %s 失败: %v", testDBName, err)
+	}
+
+	dsn := testDSN(t, testDBName)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	store, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	if err := store.InitDB(ctx); err != nil {
+		store.Close()
+		t.Fatalf("InitDB: %v", err)
+	}
+
+	// 每个测试开始前清空数据
+	resetTestTables(t, store)
+
+	t.Cleanup(func() {
+		store.Close()
+		dropTestDB(t, testDBName)
+	})
+
+	return store
 }
 
 // TestBuildPgDSN 测试 BuildPgDSN 函数生成正确的 PostgreSQL 连接字符串。
@@ -81,51 +166,6 @@ func TestValidDatabaseName(t *testing.T) {
 			t.Errorf("validDatabaseName(%q) = true, want false", name)
 		}
 	}
-}
-
-// newTestStore 创建用于集成测试的 PgStore 实例，测试结束后自动清理数据库。
-func newTestStore(t *testing.T) *PgStore {
-	t.Helper()
-	dbname := "test_hiddos_ecp_" + strings.ToLower(strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()))
-	dsn := testDSN(t, dbname)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	store, err := NewPgStore(ctx, dsn)
-	if err != nil {
-		t.Fatalf("NewPgStore: %v", err)
-	}
-
-	t.Cleanup(func() {
-		store.Close()
-
-		// 用独立 context 做清理
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		adminDSN := testDSN(t, "postgres")
-		adminConn, err := pgx.Connect(cleanupCtx, adminDSN)
-		if err != nil {
-			t.Logf("cleanup: 连接 postgres 失败: %v", err)
-			return
-		}
-		defer adminConn.Close(cleanupCtx)
-
-		// 终止目标库所有连接
-		tag, _ := adminConn.Exec(cleanupCtx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, dbname)
-		t.Logf("cleanup: terminated %s for %s", tag, dbname)
-		time.Sleep(300 * time.Millisecond)
-
-		// 删除数据库
-		tag, err = adminConn.Exec(cleanupCtx, `DROP DATABASE IF EXISTS `+quotePGIdentifier(dbname))
-		if err != nil {
-			t.Logf("cleanup: DROP %s 失败: %v", dbname, err)
-		} else {
-			t.Logf("cleanup: %s %s", tag, dbname)
-		}
-	})
-
-	return store
 }
 
 // TestSaveAndLoad 测试规则的保存和加载功能。

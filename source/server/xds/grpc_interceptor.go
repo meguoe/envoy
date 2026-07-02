@@ -7,9 +7,7 @@ package xdsserver
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
-	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -33,9 +31,6 @@ type GRPCMetrics struct {
 var globalGRPCMetrics = &GRPCMetrics{
 	RequestsByMethod: make(map[string]*atomic.Uint64),
 }
-
-// GetGRPCMetrics 返回全局 gRPC 指标实例。
-func GetGRPCMetrics() *GRPCMetrics { return globalGRPCMetrics }
 
 // incMethod 原子递增指定 gRPC 方法的请求计数。
 func (m *GRPCMetrics) incMethod(method string) {
@@ -90,16 +85,6 @@ func GRPCMetricsSnapshot() GRPCMetricsSnapshotData {
 		RequestsFailed:    m.RequestsFailed.Load(),
 		RequestsByMethod:  byMethod,
 	}
-}
-
-// GRPCMetricsHandler 输出 gRPC 指标 JSON（独立端点备用）。
-func GRPCMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(GRPCMetricsSnapshot())
 }
 
 // UnaryServerInterceptor 日志 + 指标拦截器

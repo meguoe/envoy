@@ -304,24 +304,34 @@ func logAccess(r *http.Request, reqID string, status int, duration time.Duration
 	}
 }
 
-// handleCreate 处理 POST /rules 请求，解析 JSON 请求体并创建新规则。
-func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
+// decodeRuleBody 从请求体解码 ProxyRule，检查 trailing content 和端口范围。
+func decodeRuleBody(w http.ResponseWriter, r *http.Request, maxBodyBytes int64) (*xdsserver.ProxyRule, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var rule xdsserver.ProxyRule
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&rule); err != nil {
 		respErr(w, 400, "JSON 解析失败")
-		return
+		return nil, false
 	}
 	var trailing json.RawMessage
 	if err := dec.Decode(&trailing); err != io.EOF {
 		respErr(w, 400, "JSON 后有多余内容")
-		return
+		return nil, false
 	}
 	rule.ID = ""
 
+	// listen_port 为 0 时表示不指定端口（继承旧值），仅在明确指定时校验范围
 	if rule.ListenPort != 0 && (rule.ListenPort < 10 || rule.ListenPort > 65535) {
 		respErr(w, 400, "listen_port 超出范围 (10-65535)")
+		return nil, false
+	}
+	return &rule, true
+}
+
+// handleCreate 处理 POST /rules 请求，解析 JSON 请求体并创建新规则。
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
+	rule, ok := decodeRuleBody(w, r, s.maxBodyBytes)
+	if !ok {
 		return
 	}
 
@@ -336,7 +346,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_, newRev, err := s.store.MutateRulesAndBumpRevision(ctx, func(currentRules []*xdsserver.ProxyRule) ([]*xdsserver.ProxyRule, error) {
 		nextRules := make([]*xdsserver.ProxyRule, 0, len(currentRules)+1)
 		nextRules = append(nextRules, currentRules...)
-		nextRules = append(nextRules, &rule)
+		nextRules = append(nextRules, rule)
 		if err := xdsserver.CheckRulesConflicts(nextRules); err != nil {
 			return nil, err
 		}
@@ -355,7 +365,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if s.notifier != nil {
 		s.notifier.NotifyRevision(newRev)
 	}
-	respCreated(w, &rule)
+	respCreated(w, rule)
 }
 
 // handleGetOne 处理 GET /rules/{id} 请求，返回指定 ID 的规则详情。
@@ -376,22 +386,8 @@ func (s *Server) handleGetOne(w http.ResponseWriter, r *http.Request, id string)
 
 // handleUpdate 处理 PUT /rules/{id} 请求，更新指定规则的配置字段。
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, id string) {
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
-	var rule xdsserver.ProxyRule
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&rule); err != nil {
-		respErr(w, 400, "JSON 解析失败")
-		return
-	}
-	var trailing json.RawMessage
-	if err := dec.Decode(&trailing); err != io.EOF {
-		respErr(w, 400, "JSON 后有多余内容")
-		return
-	}
-	rule.ID = ""
-
-	if rule.ListenPort != 0 && (rule.ListenPort < 10 || rule.ListenPort > 65535) {
-		respErr(w, 400, "listen_port 超出范围 (10-65535)")
+	rule, ok := decodeRuleBody(w, r, s.maxBodyBytes)
+	if !ok {
 		return
 	}
 
@@ -421,7 +417,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, id string)
 				if len(rule.Backends) == 0 {
 					rule.Backends = old.Backends
 				}
-				cp := rule
+				cp := *rule
 				updatedRule = &cp
 				nextRules = append(nextRules, &cp)
 				found = true

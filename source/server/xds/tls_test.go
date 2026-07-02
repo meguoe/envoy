@@ -153,6 +153,24 @@ func TestTLSConfigBadCA(t *testing.T) {
 	}
 }
 
+// TestTLSConfigEmptyClientURI 测试 ClientURI 为空时返回错误。
+func TestTLSConfigEmptyClientURI(t *testing.T) {
+	dir := t.TempDir()
+	caPath, serverCertPath, serverKeyPath := generateTestCert(t, dir, "")
+
+	cfg := &TLSConfig{
+		ServerCert: serverCertPath,
+		ServerKey:  serverKeyPath,
+		CACert:     caPath,
+		ClientURI:  "",
+	}
+
+	_, err := cfg.ServerCredentials()
+	if err == nil {
+		t.Error("ServerCredentials with empty ClientURI: expected error")
+	}
+}
+
 // TestTLSVerifyConnectionMatch 测试 SPIFFE URI 匹配时 TLS 握手成功。
 func TestTLSVerifyConnectionMatch(t *testing.T) {
 	dir := t.TempDir()
